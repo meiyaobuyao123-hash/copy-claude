@@ -1,506 +1,531 @@
-# Claude Code v1.0.3 — 开发级产品需求文档 (PRD)
+# Claude Code v1.0.3 — 产品需求文档 (PRD)
 
-> 本文档基于 `@anthropic-ai/claude-code@1.0.3` npm 包逆向分析，精确到可直接照此开发出功能一致的产品。
-
----
-
-## 一、产品架构
-
-### 1.1 技术栈
-
-| 层级 | 技术选型 |
-|------|----------|
-| 运行时 | Node.js >= 18 |
-| 语言 | TypeScript -> esbuild 打包成单文件 `cli.js` |
-| 终端 UI | React 18 + Ink（终端渲染框架） |
-| CLI 框架 | Commander.js |
-| 打包工具 | esbuild（输出单 ESM 文件） |
-| Schema 校验 | Zod |
-| 代码搜索 | 内嵌 ripgrep 二进制（vendor/ripgrep/） |
-| 分发方式 | npm 包，`npm install -g @anthropic-ai/claude-code` |
-| AI 后端 | Anthropic Messages API (`/v1/messages`) |
-
-### 1.2 入口命令
-
-```
-#!/usr/bin/env -S node --no-warnings --enable-source-maps
-```
-
-包名: `@anthropic-ai/claude-code`
-版本: `1.0.3`
-bin 入口: `cli.js`
-
-### 1.3 目录结构（npm 包内）
-
-```
-package/
-├── cli.js              # 主程序（esbuild 单文件 bundle，7.2MB）
-├── package.json
-├── LICENSE.md
-├── README.md
-├── yoga.wasm           # Yoga 布局引擎（Ink 终端布局用）
-├── scripts/
-│   └── preinstall.js   # 安装前置脚本
-└── vendor/
-    ├── ripgrep/        # 各平台 rg 二进制
-    │   ├── arm64-darwin/rg
-    │   ├── arm64-linux/rg
-    │   ├── x64-darwin/rg
-    │   ├── x64-linux/rg
-    │   └── x64-win32/rg.exe
-    └── claude-code.vsix           # VS Code 扩展
-    └── claude-code-jetbrains-plugin/  # JetBrains 插件 JAR
-```
+> 本文档基于 `@anthropic-ai/claude-code@1.0.3` 逆向分析编写。
+> 阅读说明：每个功能先用大白话讲"是什么、为什么"，再在「开发规格」里给出精确技术参数。产品经理看前半段，开发看后半段。
 
 ---
 
-## 二、CLI 命令与参数定义
+## 一、这个产品是什么
 
-### 2.1 主命令: `claude`
+### 一句话
+
+Claude Code 是一个跑在终端里的 AI 编程助手。你在终端里打字告诉它你想做什么，它就自动帮你读代码、改代码、跑命令、搜文件，全程不用离开终端。
+
+### 打个比方
+
+- **GitHub Copilot** = 坐在你 VS Code 编辑器里的助手，你打字它补全
+- **Claude Code** = 坐在你终端里的全能工程师，你说话它动手干活
+
+### 为什么做成终端工具
+
+因为不管你用什么编辑器（VS Code、Vim、Emacs、JetBrains），你一定会用终端。做成终端工具 = 兼容所有开发者的工作方式。而且在远程服务器上 SSH 也能直接用。
+
+### 安装方式
+
+一行命令：`npm install -g @anthropic-ai/claude-code`
+
+安装完输入 `claude` 就能用。
+
+---
+
+## 二、给谁用的
+
+| 用户 | 为什么需要 |
+|------|-----------|
+| 后端工程师 | 天天泡在终端里，不想为了 AI 切换到别的工具 |
+| 运维/DevOps | 主要靠命令行工作，需要 AI 帮忙写脚本、查问题 |
+| 全栈开发 | 同时维护好几个项目，需要快速搞懂陌生代码 |
+| Vim/终端重度用户 | 就是不想用 GUI 编辑器 |
+
+---
+
+## 三、产品功能全景图
+
+把所有功能按重要程度分三级：
+
+**P0 = 没这个就不能用：**
+- 对话系统（和 AI 聊天）
+- 文件操作（读/写/编辑文件）
+- 执行命令（跑终端命令）
+- 代码搜索（找文件、搜内容）
+- 安全权限（防止 AI 乱来）
+- 登录认证
+
+**P1 = 没这个体验很差：**
+- 上下文压缩（聊太久不会"失忆"）
+- Git 集成（帮你提交代码、建 PR）
+- 快捷命令（/help、/clear 这种）
+- 任务清单（复杂任务拆步骤）
+- 项目配置文件（告诉 AI 你的项目规范）
+- 费用显示
+- 界面美化
+
+**P2 = 锦上添花：**
+- MCP 插件系统（接入第三方工具）
+- 脚本模式（在自动化脚本里用 AI）
+- 切换不同 AI 模型
+- IDE 扩展（VS Code / JetBrains 联动）
+
+---
+
+## 四、P0 功能详细说明
+
+### 4.1 对话系统
+
+#### 是什么
+
+启动程序后进入一个对话界面，你打字问问题，AI 回答。跟微信聊天一样，但 AI 不只会说话——它会直接动手操作你的文件和命令。
+
+#### 用起来是这样的
 
 ```
-claude [prompt] [options]
+你打开终端，输入 claude 回车
+  → 看到欢迎界面
+  → 你输入："帮我看看这个项目是干什么的"
+  → AI 自动扫描文件、读取关键文件、给你解释（边想边说，不用等）
+  → 你继续问："找一下处理支付的代码"
+  → AI 自动搜索、找到、读取、解释
+  → 想退出就按 Ctrl+C
 ```
 
-| 参数/选项 | 类型 | 默认值 | 说明 |
-|-----------|------|--------|------|
-| `[prompt]` | string | 无 | 可选的初始提问 |
-| `-c, --cwd <cwd>` | string | 当前目录 | 工作目录 |
-| `-d, --debug` | boolean | false | 调试模式 |
-| `--verbose` | boolean | false | 详细输出 |
-| `-ea, --enable-architect` | boolean | false | 启用 Architect 工具 |
-| `-p, --print` | boolean | false | 非交互模式：输出结果后退出 |
-| `--dangerously-skip-permissions` | boolean | false | 跳过权限检查（仅 Docker 无网络环境） |
-| `-v, --version` | - | - | 显示版本号 |
+#### AI 的"性格设定"（非常关键，决定产品体感）
 
-**行为逻辑**:
-- 无 `--print`: 启动交互式 REPL（React/Ink 渲染）
-- 有 `--print`: 单次调用 API，输出纯文本到 stdout，退出码 0=成功 1=错误
-- 支持从 stdin 读取输入（管道模式）
+| 规则 | 说明 | 举例 |
+|------|------|------|
+| 极简回答 | 能一个词回答就不写一段话 | 问"2+2"→回答"4"，不说"2加2等于4" |
+| 不废话 | 不加开头语和结尾语 | 不说"根据我的分析..."、"希望对你有帮助" |
+| 4 行以内 | 除非你要求详细，否则不超过 4 行 | - |
+| 不主动加戏 | 你没问就不多做 | 修完 bug 就停，不自作主张总结一遍 |
+| 抄作业 | 模仿你项目已有的代码风格 | 你项目用 Tab 缩进，AI 也用 Tab |
+| 不加注释 | 除非你明确要求 | - |
 
-### 2.2 子命令: `claude config`
+> **开发规格**: 这些规则通过 System Prompt 注入给 AI 模型，完整文本见本文第九章。
 
-```
-claude config get <key> [-g|--global] [-c|--cwd <cwd>]
-claude config set <key> <value> [-g|--global] [-c|--cwd <cwd>]
-claude config remove <key> [-g|--global] [-c|--cwd <cwd>]
-claude config list [-g|--global] [-c|--cwd <cwd>]
-```
+#### 技术上怎么实现
 
-- `--global`: 使用全局配置（用户级）
-- 不带 `--global`: 使用项目级配置
+| 项 | 规格 |
+|----|------|
+| 终端 UI 框架 | React 18 + Ink（React 的终端版，把组件渲染成终端文字） |
+| 布局引擎 | Yoga WASM（CSS Flexbox 布局） |
+| 显示效果 | 支持 Markdown 渲染、代码语法高亮、加载动画 |
+| 输出方式 | 流式（AI 边想边显示，像打字机，不用等全部生成完） |
+| 支持的终端 | iTerm2, Kitty, Ghostty, Apple Terminal, VS Code 终端等 |
 
-### 2.3 子命令: `claude approved-tools`
+> **开发规格 — 流式事件类型**: AI 返回消息时按顺序触发以下事件:
+> `message_start` → `content_block_start` → `content_block_delta`（文本/工具调用/思考过程的增量更新）→ `content_block_stop` → `message_stop`
 
-```
-claude approved-tools list
-claude approved-tools remove <tool>
-```
+---
 
-管理用户已批准"始终允许"的工具列表。
+### 4.2 文件操作
 
-### 2.4 子命令: `claude mcp`
+AI 内置了一组"工具"，能像人一样读写文件。这是 AI 能帮你改代码的基础。
 
-```
-claude mcp serve                                    # 以 MCP 服务端模式运行
-claude mcp add <name> <command> [args...] [-s scope] [-e env...]  # 添加 stdio MCP 服务
-claude mcp remove <name> [-s scope]                 # 移除 MCP 服务
-claude mcp list                                     # 列出所有 MCP 服务
-claude mcp get <name>                               # 查看某个 MCP 服务详情
-```
+#### 4.2.1 读文件
 
-| 选项 | 说明 |
+**是什么**: AI 能打开你项目里的任何文件来看。
+
+**能读什么**:
+- 普通代码/文本文件
+- 图片（PNG、JPG）——AI 看图片能理解内容
+- PDF 文档（每次最多看 20 页）
+- Jupyter Notebook（数据分析用的那种文件）
+
+**限制**: 默认读前 2000 行。大文件可以指定从哪行开始看、看多少行。
+
+**需要你确认吗**: 不用，自动执行（只是看看，又不改东西）
+
+> **开发规格 — ReadTool**:
+> - 工具名: `"Read"`
+> - 只读: `true`
+> - 权限: 始终 `allow`
+> - 输入参数: `file_path`(必填, string), `offset`(选填, number), `limit`(选填, number)
+> - 输出格式: 带行号的文本（`cat -n` 格式）
+> - 副作用: 读取后存入 `readFileState` Map，记录 `{content, mtime}`
+
+#### 4.2.2 写文件（创建新文件）
+
+**是什么**: AI 能帮你创建新文件，或完全覆盖现有文件。
+
+**需要你确认吗**: 要！每次写文件前会弹确认框。
+
+**安全规则**: 如果要覆盖已有文件，AI 必须先读过这个文件（防止瞎改没看过的东西）。
+
+> **开发规格 — WriteTool**:
+> - 工具名: `"Write"`
+> - 只读: `false`
+> - 权限: `ask`（需用户确认）
+> - 输入参数: `file_path`(必填, string), `content`(必填, string)
+> - 校验规则: ① 路径不在忽略目录中 ② 文件已存在时必须先 Read 过 ③ 检测 mtime 是否被外部修改
+
+#### 4.2.3 编辑文件（改现有代码）
+
+**是什么**: AI 精准修改文件中的某一段，不用重写整个文件。
+
+**工作方式**: "把这段旧代码替换成新代码"——精准查找替换。
+
+**需要你确认吗**: 要！
+
+**安全规则（最重要的两条）**:
+1. **先读后改**: AI 必须先读过这个文件才能改。你让它改一个没看过的文件，它会自动先去读。
+2. **检测别人改了没**: AI 记住每个文件的修改时间。如果你在别的编辑器改了同一个文件，AI 再改之前会发现"这文件被别人动过了"并提醒。
+
+> **开发规格 — EditTool**:
+> - 工具名: `"Edit"`
+> - 只读: `false`
+> - 权限: `ask`
+> - 输入参数: `file_path`(必填), `old_string`(必填), `new_string`(必填), `expected_replacements`(选填, 默认1)
+> - 校验: ① `old_string` 在文件中存在 ② 匹配次数 = `expected_replacements` ③ 文件在 readFileState 中 ④ mtime 未变
+
+#### 4.2.4 编辑 Jupyter Notebook
+
+**是什么**: 数据科学家用的 .ipynb 文件，AI 能编辑里面的某个代码格子。
+
+> **开发规格 — NotebookEditTool**:
+> - 工具名: `"NotebookEdit"`
+> - 输入: `notebook_path`, `cell_number`(0开始), `new_source`, `cell_type`("code"/"markdown"), `edit_mode`("replace"/"insert"/"delete")
+
+---
+
+### 4.3 执行终端命令
+
+#### 是什么
+
+AI 能在你的终端里跑命令。你说"跑一下测试"，它就执行 `npm test`。你说"装一下这个依赖"，它就执行 `npm install xxx`。
+
+#### 为什么这个很厉害
+
+其他 AI 助手只能"建议你跑什么命令"。Claude Code 直接帮你跑。
+
+#### 沙箱机制（最精妙的设计）
+
+问题是：有些命令安全（比如看看文件列表），有些命令危险（比如删除文件）。总不能每条命令都问你"确认吗？"——太烦了。也不能什么都自动执行——太危险。
+
+解决方案：**沙箱模式**。
+
+| 命令类型 | 模式 | 需要你确认吗 | 例子 |
+|----------|------|-------------|------|
+| 只看不动的 | 沙箱(sandbox=true) | 不用，秒执行 | `ls`, `git status`, `cat`, `git log` |
+| 要改东西的 | 非沙箱(sandbox=false) | 要确认 | `npm install`, `rm`, `git push`, `mkdir` |
+
+**关键规则**: 如果沙箱模式执行失败报"权限不足"，系统自动切换到非沙箱重试（而不是报错给你看）。
+
+> **开发规格 — BashTool**:
+> - 工具名: `"Bash"`
+> - 输入: `command`(必填), `timeout`(选填, 最大600000ms), `description`(选填), `sandbox`(选填, boolean)
+> - 默认超时: 120000ms (2分钟)
+> - 最大超时: 600000ms (10分钟)
+> - 输出截断: 超过 30000 字符截断
+> - 沙箱=true 的命令: ls, cat, head, tail, rg, find, du, df, ps, file, stat, wc, diff, git status/log/diff/show/branch, npm list, echo, pwd, whoami, which, --version, --help
+> - 沙箱=false 的命令: npm run/install, cargo build/test, make, pytest, jest, gh, touch, mkdir, rm, mv, cp, git add/commit/push, ping, curl, ssh
+> - Shell 环境: 优先 zsh，回退 bash；创建隔离临时目录执行
+
+---
+
+### 4.4 代码搜索
+
+两个搜索工具，一个按文件名找，一个按内容找。
+
+#### 按文件名搜（GlobTool）
+
+你说"找到所有测试文件"，AI 用 `**/*.test.ts` 这种模式搜。
+
+> **开发规格**: 工具名 `"Glob"`，只读，输入 `pattern`(必填) + `path`(选填)，底层用 glob 匹配
+
+#### 按代码内容搜（GrepTool）
+
+你说"搜一下所有调用了 sendEmail 的地方"，AI 在所有文件里搜这个关键词。
+
+> **开发规格**: 工具名 `"Grep"`，只读，输入 `pattern`(必填, 正则) + `path`(选填) + `include`(选填, 文件类型过滤)，底层调用内嵌的 ripgrep 二进制
+
+---
+
+### 4.5 安全权限系统
+
+#### 大白话版
+
+AI 做的每件事都要过安全检查。分三档：
+
+| 档位 | 意思 | 什么操作 |
+|------|------|----------|
+| 自动放行 | 安全操作，直接做 | 读文件、搜代码、看任务清单 |
+| 需要确认 | 弹框让你点"同意" | 写文件、改文件、跑命令 |
+| 直接拒绝 | 不让做 | 安全策略禁止的操作 |
+
+#### 四重保护机制
+
+1. **先读后改**: 没看过的文件不能改
+2. **外部修改检测**: 别人改了你的文件，AI 知道
+3. **沙箱执行**: 只读命令在受限环境跑（不能写文件、不能联网）
+4. **已批准列表**: 你可以把某个操作设为"以后都不用问我"
+
+> **开发规格 — 权限判断流程**:
+> ```
+> 工具被调用 → checkPermissions(input) → 返回 {behavior, updatedInput}
+>   "allow" → 直接执行
+>   "ask"  → 渲染确认 UI → 用户选 [允许/拒绝/始终允许]
+>   "deny" → 拒绝，显示错误信息
+> ```
+>
+> **readFileState 数据结构**:
+> ```
+> Map<文件路径, {content: 文件内容, timestamp: 修改时间}>
+> ```
+> ReadTool 读取后写入，WriteTool/EditTool 修改前检查。
+
+---
+
+### 4.6 登录认证
+
+使用前需要登录，因为底层要调 Anthropic 的 AI 接口。
+
+| 登录方式 | 适合谁 | 怎么操作 |
+|----------|--------|----------|
+| API Key | 个人开发者 | 输入一串密钥 |
+| SSO | 企业员工 | 通过公司系统登录 |
+| OAuth | 通用 | 浏览器跳转授权 |
+
+首次运行时提示登录，之后自动记住。用 `/login` 可以切换账号。
+
+---
+
+## 五、P1 功能详细说明
+
+### 5.1 上下文压缩
+
+**问题**: AI 有"记忆上限"（几万~几十万字）。聊久了会忘记前面的内容。
+
+**解决**: 快到上限时，把前面的对话压缩成摘要，释放空间。
+
+| 操作 | 说明 |
 |------|------|
-| `-s, --scope <scope>` | 配置范围: `project` / `global` / `mcprc`，默认 `project` |
-| `-e, --env <env...>` | 环境变量，格式 `KEY=value` |
+| 手动 | 输入 `/compact` |
+| 自动 | 快到上限时自动触发 |
 
-MCP 服务配置数据结构:
-```typescript
-interface McpServerConfig {
-  type: "stdio" | "sse";
-  // stdio 类型
-  command?: string;
-  args?: string[];
-  env?: Record<string, string>;
-  // sse 类型
-  url?: string;
-}
-```
+压缩后保留：讨论过的文件、做出的决策、待完成的任务。
 
-### 2.5 子命令: `claude doctor`
+> **开发规格**: 调用 `POST /v1/messages/count_tokens?beta=true` 估算 token 用量，接近上限时触发压缩。
+
+---
+
+### 5.2 Git 集成
+
+AI 能帮你完成代码提交的全流程：
 
 ```
+你: "帮我提交这次改动"
+AI 做了这些（自动的）:
+  1. git status — 看你改了什么
+  2. git diff — 看改动详情
+  3. git log — 学习你的 commit 风格
+  4. 生成 commit 消息 — 给你确认
+  5. git add + git commit — 提交
+```
+
+也能帮你创建 Pull Request（用 `gh` 命令），自动写标题和描述。
+
+> **开发规格**: Git commit 和 PR 创建的完整流程写在 System Prompt 里，AI 按步骤执行。commit 消息用 HEREDOC 格式传递，尾部自动加 `Co-Authored-By: Claude <noreply@anthropic.com>`。
+
+---
+
+### 5.3 快捷命令
+
+| 命令 | 做什么 |
+|------|--------|
+| `/help` | 查看帮助 |
+| `/clear` | 清空对话 |
+| `/compact` | 压缩上下文 |
+| `/config` | 管理设置 |
+| `/model` | 切换 AI 模型 |
+| `/doctor` | 诊断工具状态 |
+| `/mcp` | 管理插件 |
+| `/login` | 登录/切换账号 |
+
+---
+
+### 5.4 任务清单
+
+复杂任务时，AI 先列出步骤，再逐个执行，实时更新进度：
+
+```
+[已完成] 读取源码
+[进行中] 分析现有逻辑      ← 当前在做这个
+[待办]   设计方案
+[待办]   写代码
+[待办]   跑测试
+```
+
+规则：同一时间只有一个任务是"进行中"的。
+
+> **开发规格**: TodoWriteTool 的 todo 对象结构: `{id, content, status: "pending"|"in_progress"|"completed"|"cancelled", priority: "high"|"medium"|"low"}`
+
+---
+
+### 5.5 项目配置文件（CLAUDE.md）
+
+在项目根目录放一个叫 `CLAUDE.md` 的文件，里面写给 AI 的指令。AI 每次打开项目都会自动读取。
+
+相当于给 AI 一份"项目须知"：
+```markdown
+- 这个项目用 TypeScript + React
+- 缩进用 2 个空格
+- commit 消息写中文
+- 测试用 Jest
+```
+
+> **开发规格**: CLAUDE.md 内容作为 System Prompt 的一部分注入。配置分层: 项目级(.claude/) > 全局级(~/.claude/) > 默认值。
+
+---
+
+### 5.6 费用显示
+
+实时显示当前对话花了多少 token、预估多少钱。因为 AI 按调用量计费，用户需要知道成本。
+
+---
+
+## 六、P2 功能详细说明
+
+### 6.1 MCP 插件系统
+
+**大白话**: 就像微信小程序。Claude Code 本身只能读代码改代码跑命令。通过 MCP 插件，它能获得新能力——查数据库、发消息、管项目...
+
+**管理方式**:
+```
+claude mcp add 数据库工具 ...    # 装插件
+claude mcp list                  # 看装了啥
+claude mcp remove 数据库工具     # 卸载
+```
+
+**Claude Code 也能被别人当插件用**: `claude mcp serve` 让它变成一个服务，被其他 AI 系统调用。
+
+> **开发规格 — MCP 协议**:
+> - 协议版本: `"2025-03-26"`（兼容 `"2024-11-05"`, `"2024-10-07"`）
+> - 通信协议: JSON-RPC 2.0
+> - 传输方式: stdio（子进程）或 SSE（HTTP）
+> - 初始化握手: Client → `initialize`(带 capabilities) → Server 返回 capabilities → Client 发 `notifications/initialized`
+> - 错误码: -32000(连接关闭), -32001(超时), -32700(解析错误), -32600(无效请求), -32601(方法不存在), -32602(参数无效), -32603(内部错误)
+> - 默认超时: 60000ms
+> - 工具 schema: `{name, description?, inputSchema: {type:"object", properties?}, annotations?: {readOnlyHint, destructiveHint, idempotentHint}}`
+
+---
+
+### 6.2 脚本模式（Print 模式）
+
+不进入对话，问一个问题就退出。适合写在自动化脚本里：
+
+```bash
+claude -p "解释一下 src/auth.ts"           # 直接问
+cat error.log | claude -p "分析这个日志"     # 管道传入
+```
+
+> **开发规格**: `--print` / `-p` 参数，接收 prompt + stdin，调用 API，输出纯文本到 stdout，退出码 0=成功 1=错误。
+
+---
+
+### 6.3 多模型切换
+
+| 模型 | 特点 | 适合 |
+|------|------|------|
+| 快速模型 | 速度快、便宜 | 简单问答 |
+| 标准模型 | 均衡 | 日常编码 |
+| 最强模型 | 最聪明、最贵 | 复杂架构设计 |
+
+用 `/model` 命令或 `--model` 参数切换。
+
+---
+
+### 6.4 IDE 联动
+
+自动安装 VS Code 扩展和 JetBrains 插件，让 IDE 和终端里的 Claude Code 联动。
+
+> **开发规格**: VS Code 扩展 ID `anthropic.claude-code`，分发方式为包内 `.vsix` 文件，首次运行时 `code --install-extension` 安装。JetBrains 通过 JAR 包安装。IDE 通过 SSE/WebSocket 连接 Claude Code 进程。
+
+---
+
+## 七、CLI 命令完整定义
+
+给开发看的命令行参数全表：
+
+### 主命令
+
+```
+claude [prompt] [-c|--cwd <path>] [-d|--debug] [--verbose]
+       [-ea|--enable-architect] [-p|--print]
+       [--dangerously-skip-permissions] [-v|--version]
+```
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| prompt | string | 无 | 初始问题（可选） |
+| --cwd | string | 当前目录 | 工作目录 |
+| --debug | bool | false | 调试模式 |
+| --verbose | bool | false | 详细输出 |
+| --enable-architect | bool | false | 启用 Architect 工具 |
+| --print | bool | false | 非交互模式 |
+| --dangerously-skip-permissions | bool | false | 跳过权限（仅限 Docker 无网络环境） |
+
+### 子命令
+
+```
+claude config get|set|remove|list <key> [value] [-g|--global]
+claude approved-tools list|remove <tool>
+claude mcp serve|add|remove|list|get <name> [-s scope] [-e env...]
 claude doctor
 ```
 
-健康检查，诊断自动更新器状态。
+---
+
+## 八、环境变量
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| ANTHROPIC_API_KEY | API 密钥 | 无 |
+| BASH_MAX_OUTPUT_LENGTH | 命令输出最大字符数 | 30000 |
+| BASH_DEFAULT_TIMEOUT_MS | 命令默认超时(毫秒) | 120000 |
+| BASH_MAX_TIMEOUT_MS | 命令最大超时(毫秒) | 600000 |
+| CLAUDE_CODE_DONT_INHERIT_ENV | 不继承用户环境变量 | false |
+| CLAUDE_CODE_SSE_PORT | SSE 连接端口 | 无 |
+| FORCE_CODE_TERMINAL | 强制识别为 IDE 终端 | false |
 
 ---
 
-## 三、工具系统（Tool System）
+## 九、System Prompt 完整文本
 
-这是核心中的核心。每个工具是一个对象，结构如下:
+这是注入给 AI 的完整指令，直接决定 AI 的所有行为。照抄即可。
 
-```typescript
-interface Tool {
-  name: string;                          // 工具唯一标识
-  description(): Promise<string>;        // 给 AI 的工具说明（prompt 注入）
-  prompt(): Promise<string>;             // 给 AI 的详细使用说明
-  inputSchema: ZodSchema;               // Zod schema，定义输入参数
-  userFacingName(): string;             // 给用户显示的名称
-  isEnabled(): boolean;                 // 是否启用
-  isReadOnly(): boolean;                // 是否只读（影响权限判断）
-  checkPermissions(input): Promise<{behavior: "allow"|"ask"|"deny", updatedInput}>;
-  call(input): AsyncGenerator<ToolEvent>;  // 执行工具（生成器，支持流式输出）
-  renderToolUseMessage(): ReactElement;           // 调用时 UI
-  renderToolUseProgressMessage(): ReactElement;   // 执行中 UI
-  renderToolUseRejectedMessage(): ReactElement;   // 被拒绝 UI
-  renderToolUseErrorMessage(): ReactElement;      // 出错 UI
-  renderToolResultMessage(): ReactElement;        // 结果 UI
-  mapToolResultToToolResultBlockParam(result, toolUseId): ToolResultBlock;  // 结果 -> API 格式
-}
-```
-
-### 3.1 BashTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"Bash"` |
-| isReadOnly | `false` |
-| userFacingName | `"Bash"` |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "command": { "type": "string", "description": "The bash command to execute" },
-    "timeout": { "type": "number", "description": "Optional timeout in ms, max 600000" },
-    "description": { "type": "string", "description": "Clear description in 5-10 words" }
-  },
-  "required": ["command"]
-}
-```
-
-**沙箱模式参数** (当平台支持时额外添加):
-```json
-{
-  "sandbox": { "type": "boolean", "description": "Run in sandbox (no writes, no network)" }
-}
-```
-
-**关键常量**:
-```typescript
-BASH_DEFAULT_TIMEOUT_MS = 120000   // 2 分钟默认超时
-BASH_MAX_TIMEOUT_MS = 600000       // 10 分钟最大超时
-BASH_MAX_OUTPUT_LENGTH = 30000     // 输出最大 30KB
-```
-
-**沙箱规则**（必须精确实现）:
-
-sandbox=false（需用户确认）的命令:
-- npm run *, cargo build/test, make/ninja/meson, pytest, jest, gh
-- touch, mkdir, rm, mv, cp
-- nano, vim, 写入重定向 >
-- npm install, apt-get, brew
-- git add, git commit, git push
-- ping, curl, ssh, scp
-
-sandbox=true（自动执行）的命令:
-- ls, cat, head, tail, rg, find, du, df, ps
-- file, stat, wc, diff, md5sum
-- git status, git log, git diff, git show, git branch
-- npm list, pip list, gem list, cargo tree
-- echo, pwd, whoami, which, type, env, printenv
-- node --version, python --version
-- man, help, --help, -h
-
-**核心规则**: 如果 sandbox=true 执行失败且错误是 "Permission denied" / "Unknown host" / "Operation not permitted"，必须用 sandbox=false 重试。
-
-**Shell 快照系统**:
-```typescript
-// 创建隔离 shell 环境执行命令
-function createShellSnapshot() {
-  const tmpDir = `${os.tmpdir()}/claude-shell-snapshot-${randomHex}`;
-  const cwdFile = `${os.tmpdir()}/claude-${randomHex}-cwd`;
-  // 优先使用 zsh，回退到 bash
-  // 检查路径: /bin, /usr/bin, /usr/local/bin, /opt/homebrew/bin
-  // 超时: 10 秒
-  // 环境变量: 继承用户环境（除非 CLAUDE_CODE_DONT_INHERIT_ENV=true）
-}
-```
-
-### 3.2 ReadTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"Read"` |
-| isReadOnly | `true` |
-| checkPermissions | 始终 `{behavior: "allow"}` |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "file_path": { "type": "string", "description": "Absolute path to the file to read" },
-    "offset": { "type": "number", "description": "Line number to start reading from" },
-    "limit": { "type": "number", "description": "Number of lines to read" }
-  },
-  "required": ["file_path"]
-}
-```
-
-**行为**:
-- 默认读取前 2000 行
-- 输出格式: 带行号的 `cat -n` 格式
-- 支持读取图片文件（返回多模态内容）
-- 支持读取 PDF 文件（大 PDF 需要指定页码范围，每次最多 20 页）
-- 支持读取 Jupyter Notebook（.ipynb）文件
-- 读取后将文件路径 + 内容 + mtime 存入 `readFileState`
-
-### 3.3 WriteTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"Write"` |
-| isReadOnly | `false` |
-| userFacingName | `"Write"` |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "file_path": { "type": "string", "description": "Absolute path to file" },
-    "content": { "type": "string", "description": "Content to write" }
-  },
-  "required": ["file_path", "content"]
-}
-```
-
-**validateInput 规则**:
-1. 文件路径不能在忽略目录中（`Nx()` 检查）
-2. 如果文件已存在，必须先用 ReadTool 读过（检查 `readFileState`）
-3. 如果文件在上次读取后被外部修改（mtime 变了），警告 AI
-
-**checkPermissions**: `{behavior: "ask"}` — 需要用户确认
-
-### 3.4 EditTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"Edit"` |
-| isReadOnly | `false` |
-| userFacingName | `"Update"` |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "file_path": { "type": "string", "description": "Absolute path to file" },
-    "old_string": { "type": "string", "description": "Text to replace (empty string = create)" },
-    "new_string": { "type": "string", "description": "Replacement text" },
-    "expected_replacements": { "type": "number", "default": 1, "description": "Expected match count" }
-  },
-  "required": ["file_path", "old_string", "new_string"]
-}
-```
-
-**validateInput 规则**:
-1. 文件必须先被 ReadTool 读取过
-2. `old_string` 必须在文件中存在且匹配次数等于 `expected_replacements`
-3. 检测外部修改（mtime）
-4. `old_string` 为空字符串时表示创建新文件
-
-**checkPermissions**: `{behavior: "ask"}`
-
-### 3.5 GlobTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"Glob"` |
-| isReadOnly | `true` |
-| checkPermissions | 始终 `{behavior: "allow"}` |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "pattern": { "type": "string", "description": "Glob pattern, e.g. **/*.js" },
-    "path": { "type": "string", "description": "Directory to search in, default cwd" }
-  },
-  "required": ["pattern"]
-}
-```
-
-**prompt 给 AI 的说明**:
-```
-- Fast file pattern matching tool that works with any codebase size
-- Supports glob patterns like "**/*.js" or "src/**/*.ts"
-- Returns matching file paths sorted by modification time
-- Use this tool when you need to find files by name patterns
-```
-
-### 3.6 GrepTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"Grep"` |
-| isReadOnly | `true` |
-| checkPermissions | 始终 `{behavior: "allow"}` |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "pattern": { "type": "string", "description": "Regex pattern to search for" },
-    "path": { "type": "string", "description": "Directory to search in" },
-    "include": { "type": "string", "description": "File glob filter, e.g. *.ts" }
-  },
-  "required": ["pattern"]
-}
-```
-
-**prompt 给 AI 的说明**:
-```
-- Fast content search tool that works with any codebase size
-- Searches file contents using regular expressions
-- Supports full regex syntax (eg. "log.*Error", "function\\s+\\w+", etc.)
-- Filter files by pattern with the include parameter (eg. "*.js", "*.{ts,tsx}")
-- Returns file paths with at least one match sorted by modification time
-```
-
-底层实现: 调用 vendor 目录中的 ripgrep 二进制。
-
-### 3.7 LSTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"LS"` |
-| isReadOnly | `true` |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "path": { "type": "string", "description": "Absolute path to list" },
-    "ignore": { "type": "array", "items": {"type": "string"}, "description": "Glob patterns to ignore" }
-  },
-  "required": ["path"]
-}
-```
-
-### 3.8 TodoWriteTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"TodoWrite"` |
-| isReadOnly | `false` |
-| checkPermissions | 始终 `{behavior: "allow"}`（无需确认） |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "todos": {
-      "type": "array",
-      "description": "The updated todo list",
-      "items": {
-        "type": "object",
-        "properties": {
-          "id": { "type": "string" },
-          "content": { "type": "string" },
-          "status": { "type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"] },
-          "priority": { "type": "string", "enum": ["high", "medium", "low"] }
-        }
-      }
-    }
-  },
-  "required": ["todos"]
-}
-```
-
-**mapToolResultToToolResultBlockParam 返回文本**:
-```
-"Todos have been modified successfully. Ensure that you continue to use the todo list to track your progress. Please proceed with the current tasks if applicable"
-```
-
-### 3.9 TodoReadTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"TodoRead"` |
-| isReadOnly | `true` |
-| checkPermissions | 始终 `{behavior: "allow"}` |
-
-**inputSchema**: 空对象（无参数）
-
-**mapToolResultToToolResultBlockParam 返回文本**:
-```
-"Remember to continue to use update and read from the todo list as you make progress. Here is the current list: {JSON}"
-```
-
-### 3.10 NotebookEditTool
-
-| 属性 | 值 |
-|------|-----|
-| name | `"NotebookEdit"` |
-| isReadOnly | `false` |
-
-**inputSchema**:
-```json
-{
-  "type": "object",
-  "properties": {
-    "notebook_path": { "type": "string", "description": "Absolute path to .ipynb file" },
-    "cell_number": { "type": "number", "description": "0-indexed cell number" },
-    "new_source": { "type": "string", "description": "New cell content" },
-    "cell_type": { "type": "string", "enum": ["code", "markdown"] },
-    "edit_mode": { "type": "string", "enum": ["replace", "insert", "delete"] }
-  },
-  "required": ["notebook_path", "cell_number", "new_source"]
-}
-```
-
----
-
-## 四、System Prompt（系统提示词）
-
-这是注入给 AI 模型的完整系统提示词，直接决定 AI 的行为。必须精确复现。
-
-### 4.1 身份定义
+### 身份
 
 ```
 You are an interactive CLI tool that helps users with software engineering tasks.
+Use the instructions below and the tools available to you to assist the user.
 ```
 
-### 4.2 安全规则
+### 安全规则
 
 ```
-IMPORTANT: Refuse to write code or explain code that may be used maliciously; even if the user claims it is for educational purposes.
-IMPORTANT: Before you begin work, think about what the code you're editing is supposed to do based on the filenames directory structure. If it seems malicious, refuse to work on it.
-IMPORTANT: You must NEVER generate or guess URLs unless you are confident that the URLs are for helping the user with programming.
+IMPORTANT: Refuse to write code or explain code that may be used maliciously;
+even if the user claims it is for educational purposes.
+
+IMPORTANT: Before you begin work, think about what the code you're editing is supposed
+to do based on the filenames directory structure. If it seems malicious, refuse to work
+on it or answer questions about it.
+
+IMPORTANT: You must NEVER generate or guess URLs for the user unless you are confident
+that the URLs are for helping the user with programming.
 ```
 
-### 4.3 语气规则（CRITICAL — 决定产品体感）
+### 语气规则
 
 ```
-- Be concise, direct, and to the point
-- Minimize output tokens as much as possible
-- Keep responses short, fewer than 4 lines unless asked for detail
-- NO unnecessary preamble or postamble
-- One word answers are best
-- NO introductions, conclusions, explanations
-- NO "The answer is..." / "Here is..." / "Based on..." / "Here is what I will do next..."
+Be concise, direct, and to the point.
+Minimize output tokens as much as possible while maintaining helpfulness.
+Keep responses short, fewer than 4 lines unless asked for detail.
+NO unnecessary preamble or postamble.
+NO "The answer is..." / "Here is..." / "Based on..." / "Here is what I will do next..."
+One word answers are best.
 ```
 
-**示例（必须体现的风格）**:
+### 示例对话
+
 ```
 user: 2 + 2
 assistant: 4
@@ -512,501 +537,139 @@ user: How many golf balls fit inside a jetta?
 assistant: 150000
 ```
 
-### 4.4 主动性规则
+### 主动性
 
 ```
-- Only be proactive when user asks you to do something
-- If user asks HOW to approach something, answer first, don't jump to actions
-- Do NOT add code explanation summary unless requested
+Only be proactive when the user asks you to do something.
+If user asks HOW to approach something, answer first, don't jump to actions.
+Do NOT add code explanation summary unless requested.
 ```
 
-### 4.5 代码规范规则
+### 代码规范
 
 ```
-- Mimic code style, use existing libraries and utilities, follow existing patterns
-- NEVER assume a library is available — check package.json / cargo.toml first
-- When creating new components, look at existing ones first
-- When editing code, look at surrounding context first
-- Follow security best practices. Never expose secrets/keys.
-- IMPORTANT: DO NOT ADD ANY COMMENTS unless asked
+Mimic code style, use existing libraries, follow existing patterns.
+NEVER assume a library is available — check package.json first.
+When creating new components, look at existing ones first.
+Follow security best practices. Never expose secrets/keys.
+IMPORTANT: DO NOT ADD ANY COMMENTS unless asked.
 ```
 
-### 4.6 Git Commit 流程（写入 system prompt）
+### Git Commit 流程（写在 prompt 里）
 
-完整的 commit 规范直接写在 prompt 里:
+```
+1. 并行执行: git status + git diff + git log
+2. 用 <commit_analysis> 标签分析改动
+3. 并行执行: git add + git commit (HEREDOC格式) + git status
+4. 尾部加: Co-Authored-By: Claude <noreply@anthropic.com>
+5. 不允许: 改 git config、用 -i 交互命令、push 到远程
+```
 
-1. **并行执行**: `git status` + `git diff` + `git log`
-2. **分析阶段**: 用 `<commit_analysis>` 标签包裹分析过程
-3. **并行执行**: `git add` + `git commit` + `git status`
-4. commit 消息用 HEREDOC 格式
-5. 尾部附加: `Co-Authored-By: Claude <noreply@anthropic.com>`
-6. 不允许: `git config` 修改、`-i` 交互式命令、push 到远程
+### PR 创建流程（写在 prompt 里）
 
-### 4.7 PR 创建流程（写入 system prompt）
-
-1. **并行执行**: `git status` + `git diff` + `git log` + `git diff main...HEAD`
-2. **分析阶段**: 用 `<pr_analysis>` 标签包裹
-3. **并行执行**: 创建分支 + push + `gh pr create`
-4. PR body 格式:
-```markdown
-## Summary
-<1-3 bullet points>
-
-## Test plan
-[Checklist...]
+```
+1. 并行执行: git status + git diff + git log + git diff main...HEAD
+2. 用 <pr_analysis> 标签分析
+3. gh pr create，body 格式:
+   ## Summary
+   <1-3 bullet points>
+   ## Test plan
+   [Checklist...]
 ```
 
 ---
 
-## 五、权限系统
+## 十、对话系统开发规格
 
-### 5.1 权限检查流程
+### API 调用
 
 ```
-工具被调用 → checkPermissions(input) → 返回 {behavior, updatedInput}
-  ├── "allow" → 直接执行
-  ├── "ask"  → 显示确认对话框 → 用户选择 [允许/拒绝/始终允许]
-  └── "deny" → 拒绝执行，显示错误
-```
+POST /v1/messages?beta=true
+Content-Type: application/json
 
-### 5.2 各工具权限
-
-| 工具 | 默认权限 | 说明 |
-|------|----------|------|
-| ReadTool | allow | 只读，无风险 |
-| GlobTool | allow | 只读 |
-| GrepTool | allow | 只读 |
-| LSTool | allow | 只读 |
-| TodoReadTool | allow | 只读 |
-| TodoWriteTool | allow | 只修改内存数据 |
-| WriteTool | ask | 写文件，需确认 |
-| EditTool | ask | 改文件，需确认 |
-| NotebookEditTool | ask | 改文件，需确认 |
-| BashTool (sandbox=true) | allow | 沙箱模式，受限执行 |
-| BashTool (sandbox=false) | ask | 需确认 |
-
-### 5.3 文件状态追踪 (readFileState)
-
-```typescript
-interface FileState {
-  content: string;       // 文件内容
-  timestamp: number;     // mtime 时间戳
-}
-
-// 全局 Map
-const readFileState: Map<string, FileState> = new Map();
-
-// ReadTool 读取文件后更新
-// WriteTool/EditTool 修改文件前检查:
-//   1. 文件是否在 readFileState 中（先读后改）
-//   2. 当前 mtime 是否等于记录的 timestamp（外部修改检测）
-```
-
-### 5.4 已批准工具列表 (approved-tools)
-
-用户可以对某个工具选择"始终允许"，存储在本地配置中:
-```typescript
-// 存储位置: ~/.claude/approved-tools 或项目级 .claude/approved-tools
-// 格式: 工具名列表
-// CLI 管理: claude approved-tools list / remove <tool>
-```
-
----
-
-## 六、对话系统
-
-### 6.1 API 调用
-
-**端点**: `POST /v1/messages?beta=true`
-
-**请求格式**:
-```typescript
 {
-  model: string,
-  max_tokens: number,
-  system: string,           // 系统提示词（第四章内容）
-  messages: Message[],       // 对话历史
-  tools: ToolDefinition[],   // 工具列表（第三章定义）
-  stream: true,              // 始终流式
-  metadata: {
-    // 请求元数据
-  }
+  "model": "模型ID",
+  "max_tokens": 数字,
+  "system": "第九章的 System Prompt",
+  "messages": [对话历史],
+  "tools": [第三章定义的工具列表],
+  "stream": true
 }
 ```
 
-**工具定义发送给 API 的格式**:
-```typescript
-interface ToolDefinition {
-  name: string;
-  description: string;
-  input_schema: {
-    type: "object";
-    properties: Record<string, JsonSchema>;
-    required?: string[];
-  };
-}
-```
-
-### 6.2 流式事件处理
-
-事件类型及顺序:
-```
-message_start        → 消息开始
-content_block_start  → 内容块开始（text / tool_use / thinking）
-content_block_delta  → 内容增量更新
-  ├── text_delta          → 文本增量
-  ├── input_json_delta    → 工具输入 JSON 增量
-  ├── thinking_delta      → 思考过程增量
-  ├── citation_delta      → 引用增量
-  └── signature_delta     → 签名增量
-content_block_stop   → 内容块结束
-message_stop         → 消息结束
-```
-
-**停止原因 (stop_reason)**:
-- `end_turn` — AI 主动结束
-- `max_tokens` — 达到 token 上限
-- `stop_sequence` — 命中停止序列
-- `tool_use` — AI 需要调用工具
-
-### 6.3 对话循环核心逻辑
+### 对话循环（核心状态机）
 
 ```
-while (true) {
-  1. 发送 messages + tools 到 API（流式）
-  2. 接收流式响应，实时渲染文本
-  3. 检查 stop_reason:
-     - "end_turn" → 等待用户输入
-     - "tool_use" → 提取工具调用:
-       a. 解析 tool_use block 中的 name 和 input
-       b. 查找对应 Tool 对象
-       c. 调用 checkPermissions(input)
-       d. 如果 "ask" → 显示确认 UI → 等待用户选择
-       e. 如果允许 → 执行 tool.call(input)
-       f. 将结果封装为 tool_result 追加到 messages
-       g. 回到步骤 1 继续对话
-  4. 用户输入新消息 → 追加到 messages → 回到步骤 1
-}
-```
-
-### 6.4 Token 计数
-
-**端点**: `POST /v1/messages/count_tokens?beta=true`
-
-用于在发送前估算 token 用量，决定是否需要压缩上下文。
-
-### 6.5 上下文压缩 (Compact)
-
-当对话 token 接近模型上下文窗口限制时:
-1. 手动触发: 用户输入 `/compact`
-2. 自动触发: token 用量接近上限
-3. 压缩逻辑: 将早期对话替换为 AI 生成的摘要，保留关键上下文
-
----
-
-## 七、MCP 协议实现
-
-### 7.1 协议版本
-
-```typescript
-const LATEST_PROTOCOL_VERSION = "2025-03-26";
-const SUPPORTED_PROTOCOL_VERSIONS = ["2025-03-26", "2024-11-05", "2024-10-07"];
-const JSONRPC_VERSION = "2.0";
-```
-
-### 7.2 消息类型
-
-基于 JSON-RPC 2.0:
-
-```typescript
-// 请求
-{ jsonrpc: "2.0", id: number|string, method: string, params?: object }
-
-// 响应
-{ jsonrpc: "2.0", id: number|string, result: object }
-
-// 错误
-{ jsonrpc: "2.0", id: number|string, error: { code: number, message: string, data?: any } }
-
-// 通知（无 id，无需响应）
-{ jsonrpc: "2.0", method: string, params?: object }
-```
-
-### 7.3 错误码
-
-```typescript
-enum ErrorCode {
-  ConnectionClosed = -32000,
-  RequestTimeout   = -32001,
-  ParseError       = -32700,
-  InvalidRequest   = -32600,
-  MethodNotFound   = -32601,
-  InvalidParams    = -32602,
-  InternalError    = -32603,
-}
-```
-
-### 7.4 初始化握手
-
-```
-Client → Server: initialize { protocolVersion, capabilities, clientInfo }
-Server → Client: { protocolVersion, capabilities, serverInfo, instructions? }
-Client → Server: notifications/initialized
-```
-
-**客户端能力**:
-```typescript
-{
-  experimental?: {},
-  sampling?: {},      // 支持 createMessage
-  roots?: {
-    listChanged?: boolean
-  }
-}
-```
-
-**服务端能力**:
-```typescript
-{
-  experimental?: {},
-  logging?: {},
-  completions?: {},
-  prompts?: { listChanged?: boolean },
-  resources?: { subscribe?: boolean, listChanged?: boolean },
-  tools?: { listChanged?: boolean }
-}
-```
-
-### 7.5 MCP 工具 Schema
-
-```typescript
-{
-  name: string,
-  description?: string,
-  inputSchema: {
-    type: "object",
-    properties?: Record<string, JsonSchema>
-  },
-  annotations?: {
-    title?: string,
-    readOnlyHint?: boolean,
-    destructiveHint?: boolean,
-    idempotentHint?: boolean,
-    openWorldHint?: boolean
-  }
-}
-```
-
-### 7.6 传输方式
-
-- **stdio**: 子进程，通过 stdin/stdout 通信
-- **SSE**: HTTP Server-Sent Events
-
-### 7.7 MCP 客户端方法
-
-```typescript
-class McpClient {
-  ping()
-  complete(params)
-  setLoggingLevel(level)
-  getPrompt(params)
-  listPrompts(params)
-  listResources(params)
-  readResource(params)
-  subscribeResource(params)
-  unsubscribeResource(params)
-  callTool(params)
-  listTools(params)
-  sendRootsListChanged()
-}
-```
-
-默认请求超时: 60000ms
-
----
-
-## 八、认证系统
-
-### 8.1 认证方式
-
-| 方式 | 环境变量/配置 | 说明 |
-|------|---------------|------|
-| API Key | `ANTHROPIC_API_KEY` | 直接 API 密钥 |
-| SSO | AWS SSO 集成 | 企业级 |
-| OAuth | 浏览器跳转 | 通用 |
-| AWS Cognito | `loadCognitoIdentity` | AWS 身份 |
-
-### 8.2 认证存储
-
-认证信息存储在 `~/.claude/` 目录下（具体文件名从代码中未完全提取）。
-
----
-
-## 九、配置系统
-
-### 9.1 配置层级
-
-```
-项目级: .claude/ 目录 (最高优先级)
-   ↓
-全局级: ~/.claude/ 目录
-   ↓
-默认值: 程序内置
-```
-
-### 9.2 项目级指令文件: CLAUDE.md
-
-- 位置: 项目根目录 `CLAUDE.md`
-- 作用: 内容作为系统提示词的一部分自动注入
-- 格式: Markdown 自由格式
-
----
-
-## 十、终端 UI 系统
-
-### 10.1 技术栈
-
-- **React 18**: 组件化 UI
-- **Ink**: React 终端渲染器（将 React 组件渲染到终端）
-- **Yoga (WASM)**: CSS Flexbox 布局引擎
-- **组件**: `<Box>`, `<Text>`, `<Newline>` 等 Ink 原生组件
-
-### 10.2 终端检测
-
-```typescript
-// 支持的终端
-const terminals = {
-  "vscode": "VS Code",
-  "cursor": "Cursor",
-  "windsurf": "Windsurf",
-  "pycharm": "PyCharm",
-  "intellij": "IntelliJ IDEA",
-  "webstorm": "WebStorm",
-  // ... 其他 JetBrains IDE
-};
-
-// Unicode 支持检测
-function isUnicodeSupported(): boolean {
-  // 检查 TERM, TERM_PROGRAM, WT_SESSION 等环境变量
-}
-```
-
-### 10.3 UI 组件列表
-
-核心组件:
-- 消息气泡渲染（用户消息 / AI 消息）
-- 工具调用确认对话框
-- Todo 列表展示
-- 加载动画（spinner）
-- Markdown 渲染
-- 代码块 + 语法高亮
-- 错误展示
-- 进度指示器
-
-### 10.4 键盘快捷键
-
-```typescript
-// 通过 useInput hook 处理键盘输入
-{
-  upArrow, downArrow, leftArrow, rightArrow,
-  pageDown, pageUp, home, end,
-  return, escape,
-  ctrl, shift, meta, fn,
-  tab, backspace, delete
-}
+循环:
+  1. 发消息给 API（流式）
+  2. 实时渲染 AI 回复
+  3. 看 AI 停下来的原因:
+     - "end_turn" → 等用户输入新消息
+     - "tool_use" → AI 要用工具:
+         a. 找到对应工具
+         b. 检查权限
+         c. 需要确认 → 弹确认框
+         d. 允许 → 执行工具
+         e. 把结果放回对话
+         f. 回到步骤1 继续
+  4. 用户输入 → 回到步骤1
 ```
 
 ---
 
-## 十一、IDE 扩展集成
+## 十一、关键文件路径
 
-### 11.1 VS Code 扩展
-
-- 扩展 ID: `anthropic.claude-code`
-- 分发: 包内 `vendor/claude-code.vsix`
-- 安装: 首次运行时自动安装 (`code --install-extension`)
-
-### 11.2 JetBrains 插件
-
-- 分发: 包内 `vendor/claude-code-jetbrains-plugin/`
-- 支持: PyCharm, IntelliJ, WebStorm, PhpStorm, RubyMine, CLion, GoLand, Rider, DataGrip, Android Studio 等
-
-### 11.3 IDE 连接
-
-- 通过 SSE 或 WebSocket 连接到 IDE
-- 端口发现: 读取临时文件中的端口信息
-- 健康检查: TCP 端口检测 + PID 检测
+| 路径 | 干什么用 |
+|------|----------|
+| `~/.claude/` | 全局配置（登录信息、设置等） |
+| `.claude/` | 项目级配置 |
+| `CLAUDE.md` | 项目级 AI 指令 |
+| `${tmpdir}/claude-shell-snapshot-*` | 命令执行的临时隔离环境 |
 
 ---
 
-## 十二、遥测系统
+## 十二、遥测埋点
 
-### 12.1 事件追踪函数
-
-```typescript
-function trackEvent(eventName: string, properties: Record<string, string>): void
-```
-
-### 12.2 关键事件
-
-| 事件名 | 触发时机 | 属性 |
-|--------|----------|------|
-| `tengu_init` | 启动 | entrypoint, hasInitialPrompt, hasStdin, enableArchitect, verbose, debug, print |
-| `tengu_approved_tool_remove` | 移除已批准工具 | tool, success |
-| `tengu_mcp_start` | MCP 服务启动 | providedCwd |
-| `tengu_mcp_add` | 添加 MCP 服务 | name, type, scope |
-| `tengu_mcp_delete` | 删除 MCP 服务 | name, scope |
-| `tengu_mcp_list` | 列出 MCP 服务 | - |
-| `tengu_mcp_get` | 查看 MCP 服务 | name |
-| `tengu_doctor_command` | 运行 doctor | - |
-| `tengu_ext_installed` | IDE 扩展安装 | - |
-| `tengu_ext_install_error` | IDE 扩展安装失败 | - |
-| `shell_snapshot_created` | Shell 快照创建 | snapshot_size |
-| `shell_snapshot_failed` | Shell 快照失败 | - |
-| `tengu_binary_feedback_display_decision` | 反馈显示 | decision, reason, messageIds |
+| 事件 | 触发时机 |
+|------|----------|
+| tengu_init | 程序启动 |
+| tengu_mcp_add/delete/list | MCP 操作 |
+| tengu_doctor_command | 运行 /doctor |
+| tengu_ext_installed | IDE 扩展安装成功 |
+| shell_snapshot_created | 创建命令执行环境 |
+| tengu_approved_tool_remove | 移除已批准工具 |
 
 ---
 
-## 十三、错误处理
+## 十三、竞品对比
 
-### 13.1 API 错误映射
+| | Claude Code | GitHub Copilot | Cursor | Aider |
+|--|-------------|----------------|--------|-------|
+| 在哪用 | 终端 | VS Code/JetBrains | Cursor IDE | 终端 |
+| 需要编辑器吗 | 不需要 | 需要 | 需要 | 不需要 |
+| 实时补全 | 没有 | 有 | 有 | 没有 |
+| 能跑命令吗 | 能 | 有限 | 有限 | 有限 |
+| 插件扩展 | MCP 协议 | GitHub 生态 | 内置 | 无 |
+| 定价 | 按量 | $10-39/月 | $20/月起 | 免费+按量 |
 
-| HTTP 状态码 | 处理 |
-|-------------|------|
-| 429 | 速率限制，自动重试（指数退避） |
-| 502, 503, 504 | 服务不可用，自动重试 |
-| 529 | 过载，自动重试 |
-| 401 | 认证失败 |
-| 403 | 权限不足 |
-
-### 13.2 重试策略
-
-指数退避重试，带最大重试次数限制。
+**优势**: 不绑编辑器、能真正执行命令、MCP 插件生态、完善的安全机制
+**劣势**: 没有实时补全、纯终端不如 GUI 直观、按量计费不可预测
 
 ---
 
-## 十四、环境变量
+## 十四、术语表
 
-| 变量名 | 说明 |
-|--------|------|
-| `ANTHROPIC_API_KEY` | API 密钥 |
-| `BASH_MAX_OUTPUT_LENGTH` | Bash 输出最大长度（默认 30000） |
-| `BASH_DEFAULT_TIMEOUT_MS` | Bash 默认超时（默认 120000） |
-| `BASH_MAX_TIMEOUT_MS` | Bash 最大超时（默认 600000） |
-| `CLAUDE_CODE_DONT_INHERIT_ENV` | 不继承用户环境变量 |
-| `CLAUDE_CODE_SSE_PORT` | SSE 端口 |
-| `FORCE_CODE_TERMINAL` | 强制识别为 IDE 终端 |
-| `GIT_EDITOR` | Git 编辑器（设为 "true" 跳过） |
-
----
-
-## 十五、关键文件路径
-
-| 路径 | 用途 |
-|------|------|
-| `~/.claude/` | 全局配置目录 |
-| `.claude/` | 项目级配置目录 |
-| `CLAUDE.md` | 项目级 AI 指令文件 |
-| `~/.anthropic/claude-code/vendor-temp/` | 临时 vendor 文件目录 |
-| `${tmpdir}/claude-shell-snapshot-*` | Shell 快照临时文件 |
-| `${tmpdir}/claude-*-cwd` | 工作目录临时文件 |
+| 术语 | 大白话 |
+|------|--------|
+| CLI | 终端/命令行，就是黑底白字的窗口 |
+| Token | AI 处理文字的最小单位，约等于 0.75 个英文词 |
+| 上下文窗口 | AI 的"记忆容量"，聊多了会忘前面的 |
+| MCP | 插件标准，让第三方工具接入 Claude Code |
+| Glob | 文件名匹配规则，比如 *.ts = 所有 TypeScript 文件 |
+| 正则/Regex | 强大的文本搜索规则 |
+| 沙箱/Sandbox | 受限的安全环境，只能看不能改 |
+| 流式/Streaming | 数据边生成边显示，不用等全部完成 |
+| System Prompt | 给 AI 的"人设说明书"，决定 AI 怎么说话怎么做事 |
+| HEREDOC | 一种在命令行里写多行文字的方法 |
+| JSON-RPC | 一种程序之间通信的标准格式 |
+| mtime | 文件的"最后修改时间" |
