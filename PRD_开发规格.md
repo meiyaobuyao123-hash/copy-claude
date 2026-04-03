@@ -1,0 +1,906 @@
+# Claude Code v2.1.88 — 开发规格文档
+
+> 基于泄露源码（1902个文件/51万行TypeScript）提取的完整技术规格。
+> 目标：工程团队照此文档可以实现功能等价的产品。
+> 配套文档：`PRD_产品设计分析.md`（产品经理版本，讲设计决策和why）
+
+---
+
+## 1. 技术架构
+
+### 1.1 技术栈
+
+| 层 | 选型 | 版本/说明 |
+|---|------|----------|
+| 运行时 | Node.js / Bun | >= 18 |
+| 语言 | TypeScript | strict mode, Zod schema 校验 |
+| 终端 UI | React 18 + Ink | 组件化终端渲染 |
+| 布局引擎 | Yoga (WASM) | CSS Flexbox |
+| CLI 框架 | Commander.js | 命令/参数解析 |
+| 代码搜索 | ripgrep | 内嵌各平台二进制 |
+| AI 后端 | Anthropic Messages API | `/v1/messages`, stream 模式 |
+| 插件协议 | MCP (Model Context Protocol) | JSON-RPC 2.0 |
+| 认证 | OAuth 2.0 + PKCE | Keychain 存储(macOS) |
+| 打包 | esbuild | 单文件 ESM bundle |
+| 分发 | npm | `@anthropic-ai/claude-code` |
+
+### 1.2 源码模块结构
+
+```
+src/
+├── tools/          # 40+ 工具实现（AI 的能力）
+├── commands/       # 103+ 斜杠命令
+├── components/     # 146 个 React/Ink UI 组件
+├── hooks/          # 87 个自定义 React Hook
+├── services/       # 核心服务
+│   ├── mcp/        # MCP 客户端（25+ 文件）
+│   ├── oauth/      # OAuth 认证
+│   ├── compact/    # 上下文压缩
+│   └── api/        # Anthropic API 客户端
+├── constants/      # 常量（23 个子目录）
+├── utils/          # 331 个工具函数
+├── coordinator/    # 多智能体协调器
+├── bridge/         # IDE 桥接
+├── tasks/          # 7 种后台任务
+├── memdir/         # 记忆系统
+├── skills/         # 技能加载
+├── plugins/        # 插件系统
+├── voice/          # 语音输入
+├── vim/            # Vim 模式
+├── state/          # 全局状态 (AppState)
+├── screens/        # UI 页面
+├── ink/            # 终端渲染底层
+├── keybindings/    # 快捷键
+├── context/        # React Context
+├── schemas/        # JSON Schema
+├── types/          # 类型定义
+├── remote/         # 远程执行
+├── buddy/          # 队友
+├── migrations/     # 迁移脚本
+├── bootstrap/      # 启动初始化
+├── entrypoints/    # SDK/CLI 入口
+├── query/          # 查询系统
+├── assistant/      # 会话历史
+├── server/         # 服务端
+├── upstreamproxy/  # 代理
+└── cli/            # CLI 入口
+```
+
+---
+
+## 2. CLI 完整参数定义
+
+### 2.1 主命令: `claude [prompt] [options]`
+
+**核心参数:**
+
+| 参数 | 类型 | 默认 | 说明 |
+|------|------|------|------|
+| `[prompt]` | string | - | 初始提问 |
+| `-p, --print` | bool | false | 非交互模式，输出后退出 |
+| `-c, --continue` | bool | false | 继续最近会话 |
+| `-r, --resume [id]` | string | - | 恢复指定会话 |
+| `-n, --name <name>` | string | - | 会话名称 |
+| `--model <model>` | string | - | 模型(sonnet/opus/haiku) |
+| `--effort <level>` | enum | - | low/medium/high/max |
+| `--max-turns <n>` | number | - | 最大对话轮数(print模式) |
+| `--max-budget-usd <n>` | number | - | 最大花费(print模式) |
+| `-v, --version` | - | - | 版本号 |
+
+**调试参数:**
+
+| 参数 | 类型 | 默认 |
+|------|------|------|
+| `-d, --debug [filter]` | string/bool | false |
+| `--verbose` | bool | false |
+| `--mcp-debug` | bool | false |
+| `--debug-file <path>` | string | - |
+| `-d2e, --debug-to-stderr` | bool | false |
+
+**输出格式(print模式):**
+
+| 参数 | 类型 | 默认 |
+|------|------|------|
+| `--output-format` | "text"\|"json"\|"stream-json" | "text" |
+| `--input-format` | "text"\|"stream-json" | "text" |
+| `--json-schema <schema>` | string | - |
+| `--include-hook-events` | bool | false |
+| `--include-partial-messages` | bool | false |
+
+**系统提示词:**
+
+| 参数 | 类型 | 默认 |
+|------|------|------|
+| `--system-prompt <text>` | string | - |
+| `--append-system-prompt <text>` | string | - |
+| `--system-prompt-file <path>` | string | - |
+
+**权限与工具:**
+
+| 参数 | 类型 | 默认 |
+|------|------|------|
+| `--permission-mode <mode>` | string | "default" |
+| `--tools <tools...>` | string[] | 默认列表 |
+| `--allowedTools <tools...>` | string[] | - |
+| `--disallowedTools <tools...>` | string[] | - |
+| `--dangerously-skip-permissions` | bool | false |
+
+**MCP 与扩展:**
+
+| 参数 | 类型 | 默认 |
+|------|------|------|
+| `--mcp-config <configs...>` | string[] | - |
+| `--strict-mcp-config` | bool | false |
+| `--add-dir <dirs...>` | string[] | - |
+| `--plugin-dir <path>` | string | - |
+| `--ide` | bool | false |
+| `--chrome` | bool | - |
+
+**会话管理:**
+
+| 参数 | 类型 | 默认 |
+|------|------|------|
+| `--session-id <uuid>` | string | - |
+| `--fork-session` | bool | false |
+| `--from-pr [value]` | string | - |
+| `--thinking <mode>` | "enabled"\|"adaptive"\|"disabled" | - |
+| `--fallback-model <model>` | string | - |
+| `--agent <agent>` | string | - |
+| `--betas <betas...>` | string[] | - |
+| `--bare` | bool | false |
+
+### 2.2 子命令
+
+```
+claude mcp serve [--debug] [--verbose]
+claude mcp add-json <name> <json> [--scope <scope>] [--client-secret]
+claude mcp remove <name> [--scope <scope>]
+claude mcp add-from-claude-desktop [--scope <scope>]
+
+claude auth login [--email] [--sso] [--console] [--claudeai]
+claude auth status [--json] [--text]
+
+claude plugin list [--json] [--available]
+claude plugin install <plugin> [-s scope]
+claude plugin uninstall <plugin> [-s scope] [--keep-data]
+claude plugin enable <plugin> [-s scope]
+claude plugin disable [plugin] [-a] [-s scope]
+claude plugin update <plugin> [-s scope]
+
+claude server [--port] [--host] [--auth-token] [--unix] [--workspace] [--idle-timeout] [--max-sessions]
+claude ssh <host> [dir] [--permission-mode] [--local]
+
+claude task create <subject> [-d description] [-l list]
+claude task list [-l list] [--pending] [--json]
+claude task get <id> [-l list]
+claude task update <id> [-s status] [--subject] [-d description] [--owner]
+
+claude agents [--setting-sources]
+claude log [number|sessionId]
+claude export <source> <outputFile>
+claude doctor
+claude completion <shell> [--output]
+```
+
+---
+
+## 3. 工具系统（Tool System）
+
+### 3.1 工具通用接口
+
+```typescript
+interface ToolDef {
+  name: string
+  description(): Promise<string>      // 给 AI 看的说明
+  prompt(): Promise<string>            // 给 AI 看的详细用法
+  inputSchema: ZodSchema              // 输入参数校验(Zod)
+  userFacingName(): string            // 给用户看的名称
+  isEnabled(): boolean
+  isReadOnly(): boolean
+  isConcurrencySafe(): boolean        // 能否并发调用
+  shouldDefer?: boolean               // 是否延迟加载
+  maxResultSizeChars?: number         // 输出截断上限
+  strict?: boolean                    // 严格schema校验
+
+  checkPermissions(input): Promise<PermissionDecision>
+  validateInput(input): ValidationResult
+  call(input): AsyncGenerator<ToolEvent>
+  renderToolUseMessage(): ReactElement
+  renderToolResultMessage(): ReactElement
+  mapToolResultToToolResultBlockParam(result, id): ToolResultBlock
+}
+```
+
+### 3.2 工具清单与Schema
+
+#### FileReadTool
+```
+name: "Read"
+isReadOnly: true
+permission: always allow
+input: {
+  file_path: string (required) - 绝对路径
+  offset: number (optional) - 起始行号
+  limit: number (optional) - 读取行数
+  pages: string (optional) - PDF页码范围如"1-5"
+}
+output: { content, lineCount, totalLines }
+limits: 默认 10000 token
+features: 支持文本/图片/PDF(max20页)/Jupyter Notebook
+side-effect: 存入 readFileState Map<path, {content, mtime}>
+```
+
+#### FileWriteTool
+```
+name: "Write"
+isReadOnly: false
+permission: ask (需用户确认)
+input: {
+  file_path: string (required) - 绝对路径
+  content: string (required) - 写入内容
+}
+output: { type: 'create'|'update', filePath, content, structuredPatch, originalFile, gitDiff? }
+validation:
+  1. 路径不在忽略目录中
+  2. 覆盖已有文件时必须先 Read 过
+  3. 检测 mtime 是否被外部修改
+side-effect: LSP 通知, 文件历史追踪, 技能发现
+```
+
+#### FileEditTool
+```
+name: "Edit"
+isReadOnly: false
+permission: ask
+input: {
+  file_path: string (required)
+  old_string: string (required) - 要替换的文本
+  new_string: string (required) - 替换为
+  replace_all: boolean (optional, default false)
+}
+output: { filePath, oldString, newString, originalFile, structuredPatch, replaceAll, gitDiff? }
+validation:
+  1. 文件必须在 readFileState 中(先读后改)
+  2. old_string 必须在文件中存在
+  3. 非 replace_all 时匹配必须唯一
+  4. mtime 检测
+limits: 最大文件 1 GiB
+features: 引号规范化, LSP 通知
+```
+
+#### GlobTool
+```
+name: "Glob"
+isReadOnly: true
+permission: always allow
+input: {
+  pattern: string (required) - glob模式如 "**/*.ts"
+  path: string (optional) - 搜索目录,默认cwd
+}
+output: { durationMs, numFiles, filenames: string[], truncated: boolean }
+limits: 最多返回 100 个文件
+sorting: 按修改时间排序
+```
+
+#### GrepTool
+```
+name: "Grep"
+isReadOnly: true
+permission: always allow
+input: {
+  pattern: string (required) - 正则表达式
+  path: string (optional) - 搜索目录
+  glob: string (optional) - 文件过滤如 "*.ts"
+  output_mode: "content"|"files_with_matches"|"count" (default: "files_with_matches")
+  -B: number (optional) - 匹配前N行
+  -A: number (optional) - 匹配后N行
+  -C: number (optional) - 上下文N行
+  -n: boolean (default true) - 显示行号
+  -i: boolean (optional) - 忽略大小写
+  type: string (optional) - 文件类型如 "js"
+  head_limit: number (default 250) - 限制输出条数
+  offset: number (optional) - 跳过前N条
+  multiline: boolean (optional) - 多行模式
+}
+output: { mode, numFiles, filenames, content?, numLines?, numMatches?, appliedLimit?, appliedOffset? }
+limits: 结果最大 20000 字符
+backend: ripgrep 二进制
+```
+
+#### BashTool
+```
+name: "Bash"
+isReadOnly: depends on command
+permission: sandbox=true → allow, sandbox=false → ask
+input: {
+  command: string (required)
+  timeout: number (optional, default 120000, max 600000)
+  run_in_background: boolean (optional)
+  description: string (optional) - 5-10词命令描述
+}
+output: { command, exitCode, stdout, stderr, durationMs, signalCode?, killed?, backgroundTaskId? }
+constants:
+  BASH_DEFAULT_TIMEOUT_MS = 120000
+  BASH_MAX_TIMEOUT_MS = 600000
+  BASH_MAX_OUTPUT_LENGTH = 30000
+sandbox_true_commands: ls, cat, head, tail, rg, find, du, df, ps, file, stat, wc, diff, md5sum, git status/log/diff/show/branch, npm list, pip list, echo, pwd, whoami, which, env, --version, --help
+sandbox_false_commands: npm run/install, cargo build/test, make, pytest, jest, gh, touch, mkdir, rm, mv, cp, git add/commit/push, curl, ssh, scp
+auto_background: 15-120秒无输出自动转后台
+```
+
+#### WebFetchTool
+```
+name: "WebFetch"
+isReadOnly: true
+permission: allow (预批准域名) / ask (其他)
+input: {
+  url: string (required) - 完整URL
+  prompt: string (required) - 提取什么信息
+}
+output: { bytes, code, codeText, result, durationMs, url }
+limits: 结果最大 100000 字符
+features: HTML→Markdown转换, 小模型处理内容, 15分钟缓存
+restriction: 认证URL会失败
+```
+
+#### WebSearchTool
+```
+name: "WebSearch"
+isReadOnly: true
+permission: allow
+input: {
+  query: string (required, min 2 chars)
+  allowed_domains: string[] (optional)
+  blocked_domains: string[] (optional)
+}
+output: { query, results, durationSeconds }
+limits: 最多8次搜索
+```
+
+#### AgentTool
+```
+name: "Agent"
+isReadOnly: false
+input: {
+  description: string (required) - 3-5词任务描述
+  prompt: string (required) - 完整任务描述
+  subagent_type: string (optional) - 智能体类型
+  model: "sonnet"|"opus"|"haiku" (optional)
+  run_in_background: boolean (optional)
+  name: string (optional) - 可寻址名称
+  isolation: "worktree"|"remote" (optional)
+  cwd: string (optional) - 工作目录
+}
+output: { status: 'completed'|'async_launched'|..., result }
+```
+
+#### TodoWriteTool
+```
+name: "TodoWrite"
+isReadOnly: false
+permission: always allow
+input: {
+  todos: Array<{
+    id?: string
+    content: string (required)
+    status: "pending"|"in_progress"|"completed"|"cancelled" (required)
+    priority?: "high"|"medium"|"low"
+    activeForm?: string
+  }> (required)
+}
+output: { oldTodos, newTodos, verificationNudgeNeeded? }
+```
+
+#### TaskCreateTool / TaskUpdateTool / TaskGetTool
+```
+TaskCreate input: { subject: string, description: string, activeForm?: string, metadata?: object }
+TaskUpdate input: { taskId: string, subject?, description?, activeForm?, status?: "pending"|"in_progress"|"completed"|"deleted", addBlocks?: string[], addBlockedBy?: string[], owner?: string, metadata?: object }
+TaskGet input: { taskId: string }
+```
+
+#### CronCreateTool / CronDeleteTool / CronListTool
+```
+CronCreate input: { cron: string (5字段), prompt: string, recurring?: boolean(default true), durable?: boolean(default false) }
+CronDelete input: { id: string }
+CronList input: {} (无参数)
+limits: 最多50个任务, 周期任务7天自动过期
+```
+
+#### NotebookEditTool
+```
+name: "NotebookEdit"
+isReadOnly: false
+permission: ask
+input: {
+  notebook_path: string (required) - .ipynb绝对路径
+  cell_id: string (optional) - 单元格ID
+  new_source: string (required)
+  cell_type: "code"|"markdown" (optional)
+  edit_mode: "replace"|"insert"|"delete" (default "replace")
+}
+```
+
+#### EnterWorktreeTool / ExitWorktreeTool
+```
+EnterWorktree input: { name?: string (alphanumeric+dots/dashes, max 64 chars) }
+ExitWorktree input: { action: "keep"|"remove" (required), discard_changes?: boolean }
+```
+
+#### 其他工具
+```
+SendMessage: { to: string, message: string }
+AskUserQuestion: { question: string, options?: Array<{label, description}> }
+SkillTool: { command: string, args?: string }
+RemoteTrigger: { action: "list"|"get"|"create"|"update"|"run", trigger_id?: string, body?: object }
+ToolSearch: { query: string, max_results?: number(default 5) }
+Config: { action: "get"|"set", path: string, value?: any }
+EnterPlanMode: {} (无参数)
+ExitPlanMode: { allowedPrompts?: Array<{tool, prompt}> }
+```
+
+---
+
+## 4. System Prompt
+
+### 4.1 Prefix
+```
+"You are Claude Code, Anthropic's official CLI for Claude."
+```
+
+### 4.2 核心规则注入
+
+System prompt 由模块化 section 组成，缓存在轮次之间（`/clear` 或 `/compact` 清除）。
+
+完整规则包括（按注入顺序）：
+1. 身份定义
+2. 安全规则（拒绝恶意代码、不猜URL、检查文件意图）
+3. 语气规则（4行以内、极简、不废话）
+4. 主动性规则（用户要求才行动）
+5. 代码规范（模仿风格、不加注释、先查依赖）
+6. 工具使用指南（每个工具的 prompt 字段注入）
+7. Git 操作流程（commit/PR 的标准步骤）
+8. 沙箱规则（sandbox=true/false 命令分类）
+9. 任务管理指南
+10. CLAUDE.md 内容（项目级指令）
+11. MCP 工具说明
+12. 当前 git 状态上下文
+
+### 4.3 Git Commit 流程（注入prompt）
+```
+1. 并行: git status + git diff + git log
+2. <commit_analysis> 标签分析改动
+3. 并行: git add + git commit (HEREDOC) + git status
+4. 尾部: Co-Authored-By: Claude <noreply@anthropic.com>
+5. 禁止: 改 git config, -i 交互命令, push
+```
+
+### 4.4 PR 创建流程（注入prompt）
+```
+1. 并行: git status + git diff + git log + git diff main...HEAD
+2. <pr_analysis> 标签分析
+3. gh pr create --title "..." --body "## Summary\n...\n## Test plan\n..."
+```
+
+---
+
+## 5. 权限系统
+
+### 5.1 权限模式
+
+```typescript
+type PermissionMode = 'default' | 'plan' | 'acceptEdits' | 'dontAsk' | 'bypassPermissions' | 'auto'
+```
+
+### 5.2 权限行为
+
+```typescript
+type PermissionBehavior = 'allow' | 'ask' | 'deny'
+```
+
+### 5.3 权限规则结构
+
+```typescript
+interface PermissionRule {
+  source: 'userSettings' | 'projectSettings' | 'localSettings' | 'flagSettings' | 'policySettings' | 'cliArg' | 'command' | 'session'
+  ruleBehavior: 'allow' | 'deny' | 'ask'
+  ruleValue: { toolName: string, ruleContent?: string }
+}
+```
+
+### 5.4 判断流程
+
+```
+工具调用 → 匹配规则
+  1. deny 规则优先级最高
+  2. policySettings(企业) > cliArg > session > user > project > local
+  3. auto模式 → 调用 YOLO 分类器
+     → 两阶段: fast(tool_use) + thinking(XML)
+     → 返回 { shouldBlock, reason, thinking }
+  4. ask → 渲染确认 UI → [允许/拒绝/始终允许]
+  5. 重复拒绝追踪: 达阈值后降级为提示
+```
+
+### 5.5 文件状态追踪
+
+```typescript
+// 全局 Map
+readFileState: Map<string, { content: string, mtime: number }>
+
+// ReadTool 读取后写入
+// WriteTool/EditTool 修改前检查:
+//   1. path 是否在 map 中（先读后改）
+//   2. 当前 mtime === 记录的 mtime（外部修改检测）
+```
+
+---
+
+## 6. 对话系统
+
+### 6.1 API 调用
+
+```
+POST /v1/messages?beta=true
+{
+  model: string,
+  max_tokens: number,
+  system: string,        // System Prompt
+  messages: Message[],    // 对话历史
+  tools: ToolDef[],       // 工具定义
+  stream: true
+}
+```
+
+### 6.2 流式事件
+
+```
+message_start → content_block_start → content_block_delta → content_block_stop → message_stop
+
+delta 类型:
+  text_delta         文本
+  input_json_delta   工具输入JSON
+  thinking_delta     思考过程
+  citation_delta     引用
+  signature_delta    签名
+```
+
+### 6.3 对话循环状态机
+
+```
+query(params) → AsyncGenerator<Event>
+
+loop:
+  1. POST /v1/messages (stream)
+  2. yield StreamEvent → 实时渲染
+  3. stop_reason:
+     "end_turn" → 等用户输入
+     "tool_use" → 提取工具调用 → checkPermissions → call → tool_result → 回到1
+     "max_tokens" → 上下文压缩 → 回到1
+  4. 达到 max_turns / max_budget_usd → 退出
+```
+
+### 6.4 上下文压缩
+
+```
+触发: token 用量接近上下文窗口限制
+方式:
+  - microCompact: 轻量API端压缩
+  - autoCompact: 自动触发(阈值+指数退避)
+  - compact: 完整压缩(fork子智能体)
+  - sessionMemoryCompact: 压缩时提取记忆
+
+压缩保留段:
+  Primary Request, Technical Concepts, Files/Code,
+  Errors/Fixes, Problem Solving, User Messages,
+  Pending Tasks, Current Work, Next Steps
+```
+
+---
+
+## 7. 认证系统
+
+### 7.1 OAuth 2.0 + PKCE
+
+```
+授权URL: https://claude.com/cai/oauth/authorize (Claude.ai)
+         https://platform.claude.com/oauth/authorize (Console)
+Token URL: https://platform.claude.com/v1/oauth/token
+Profile URL: https://api.anthropic.com/api/oauth/claude_cli/roles
+Client ID: 9d1c250a-e61b-44d9-88ed-5944d1962f5e
+
+Scopes:
+  user:inference
+  user:profile
+  user:sessions:claude_code
+  user:mcp_servers
+  user:file_upload
+  org:create_api_key
+
+流程:
+  1. 生成 PKCE code_verifier + code_challenge
+  2. 本地监听 localhost:PORT/callback
+  3. 打开浏览器 → 授权
+  4. 拿 code → 换 token
+  5. 存入 macOS Keychain (回退: 文件存储)
+  6. 过期前5分钟自动刷新
+```
+
+### 7.2 其他认证方式
+- `ANTHROPIC_API_KEY` 环境变量
+- AWS Bedrock / Google Vertex 原生凭据
+- Session ingress token (远程会话)
+
+---
+
+## 8. MCP 插件协议
+
+### 8.1 协议基础
+
+```
+版本: "2025-03-26" (兼容 "2024-11-05", "2024-10-07")
+通信: JSON-RPC 2.0
+传输: stdio | sse | http | ws | sdk | sse-ide | ws-ide | claudeai-proxy
+
+错误码:
+  -32000 ConnectionClosed
+  -32001 RequestTimeout
+  -32700 ParseError
+  -32600 InvalidRequest
+  -32601 MethodNotFound
+  -32602 InvalidParams
+  -32603 InternalError
+
+默认超时: 60000ms
+```
+
+### 8.2 初始化握手
+
+```
+Client → Server: initialize { protocolVersion, capabilities, clientInfo }
+Server → Client: { protocolVersion, capabilities, serverInfo, instructions? }
+Client → Server: notifications/initialized
+```
+
+### 8.3 能力协商
+
+```typescript
+// 客户端能力
+{ experimental?, sampling?, roots?: { listChanged? } }
+
+// 服务端能力
+{ experimental?, logging?, completions?, prompts?: { listChanged? }, resources?: { subscribe?, listChanged? }, tools?: { listChanged? } }
+```
+
+### 8.4 工具 Schema
+
+```typescript
+{
+  name: string,
+  description?: string,
+  inputSchema: { type: "object", properties?: Record<string, JsonSchema> },
+  annotations?: { title?, readOnlyHint?, destructiveHint?, idempotentHint?, openWorldHint? }
+}
+```
+
+### 8.5 服务配置
+
+```typescript
+// 范围
+type ConfigScope = 'local' | 'user' | 'project' | 'dynamic' | 'enterprise' | 'claudeai' | 'managed'
+
+// stdio 类型
+{ command: string, args?: string[], env?: Record<string, string> }
+
+// SSE/HTTP 类型
+{ url: string, headers?: Record<string, string>, oauth?: OAuthConfig }
+
+// WebSocket 类型
+{ url: string, headers?: Record<string, string> }
+```
+
+### 8.6 OAuth 支持
+- 完整 PKCE 流
+- Token 自动刷新
+- 跨应用访问 (XAA / SEP-990)
+- Keychain 存储(macOS)
+
+---
+
+## 9. 多智能体协调器
+
+### 9.1 启用方式
+```
+环境变量: CLAUDE_CODE_COORDINATOR_MODE=true
+```
+
+### 9.2 工作流
+```
+Research(调研) → Synthesis(综合) → Implementation(执行) → Verification(验证)
+```
+
+### 9.3 工具分配
+```
+协调器专属: TeamCreate, TeamDelete, SendMessage, SyntheticOutput
+工人可用: Bash, FileRead, FileEdit, MCP tools, Skills
+```
+
+### 9.4 并发规则
+- 读操作: 可并行
+- 写操作: 必须串行
+
+### 9.5 后台任务类型
+```
+LocalShellTask      - 命令执行
+LocalAgentTask      - 本地子智能体
+RemoteAgentTask     - 远程子智能体
+InProcessTeammateTask - 进程内队友
+LocalWorkflowTask   - 工作流
+MonitorMcpTask      - MCP监控
+DreamTask           - 后台任务
+```
+
+---
+
+## 10. 记忆系统
+
+### 10.1 入口
+```
+文件: MEMORY.md
+最大: 200 行 / 25KB
+超限: 行截断 → 字节截断 → 追加警告
+```
+
+### 10.2 记忆文件格式
+```markdown
+---
+name: 记忆名称
+description: 一行描述
+type: user | feedback | project | reference
+---
+
+记忆内容...
+```
+
+### 10.3 记忆类型
+| 类型 | 存什么 |
+|------|--------|
+| user | 用户角色、偏好、知识水平 |
+| feedback | 用户对 AI 行为的纠正和确认 |
+| project | 项目进展、决策、截止日期 |
+| reference | 外部资源位置 |
+
+### 10.4 不该记的
+- 代码结构（看代码就知道）
+- Git 历史（git log 能查）
+- 调试方案（修复在代码里）
+- 临时状态（当前会话用完就没用了）
+
+---
+
+## 11. 配置系统
+
+### 11.1 配置文件
+
+| 层级 | 路径 | 优先级 |
+|------|------|--------|
+| 企业策略 | 管理平台下发 | 最高 |
+| 用户级 | `~/.claude/globalSettings.json` | 高 |
+| 项目级 | `.claude/settings.json` | 中 |
+| 本地级 | `.claude/.local/settings.json` | 低 |
+
+### 11.2 功能开关 (Feature Flags)
+
+| 开关 | 功能 |
+|------|------|
+| PROACTIVE | AI 主动模式 |
+| KAIROS | 助手模式 |
+| KAIROS_BRIEF | 简报 |
+| VOICE_MODE | 语音 |
+| COORDINATOR_MODE | 多智能体 |
+| BRIDGE_MODE | 移动桥接 |
+| WORKFLOW_SCRIPTS | 工作流 |
+| MCP_SKILLS | MCP 技能 |
+| BUDDY | 队友 |
+| TOKEN_BUDGET | Token 预算 |
+| REACTIVE_COMPACT | 响应式压缩 |
+| BG_SESSIONS | 后台会话 |
+| TEMPLATES | 任务模板 |
+
+---
+
+## 12. IDE 桥接
+
+### 12.1 架构
+```
+终端 Claude Code ←→ Bridge (SSE/WebSocket) ←→ IDE 扩展
+```
+
+### 12.2 VS Code
+- 扩展 ID: `anthropic.claude-code`
+- 安装: 内嵌 .vsix，`code --install-extension`
+
+### 12.3 JetBrains
+- 内嵌 JAR 插件包
+- 支持: PyCharm, IntelliJ, WebStorm, GoLand, Rider 等
+
+### 12.4 连接
+- 认证: JWT Token
+- 重连: 指数退避 2s→120s→600s
+- 状态轮询: 1s 间隔
+- 多会话支持
+
+---
+
+## 13. 语音模式
+
+```
+平台:
+  macOS: audio-capture-napi (CoreAudio + AudioUnit)
+  Linux: SoX rec / ALSA arecord
+
+参数:
+  采样率: 16000 Hz
+  声道: 1 (单声道)
+  静默检测: 2秒无声停止, 阈值 3%
+
+流程: 按键录音 → 流式STT → 文本输入
+```
+
+---
+
+## 14. 费用追踪
+
+```typescript
+interface CostState {
+  totalCostUSD: number
+  totalAPIDuration: number
+  totalAPIDurationWithoutRetries: number
+  totalToolDuration: number
+  totalLinesAdded: number
+  totalLinesRemoved: number
+  modelUsage: {
+    [modelName: string]: {
+      inputTokens: number
+      outputTokens: number
+      cacheReadTokens: number
+      cacheCreationTokens: number
+      cost: number
+    }
+  }
+}
+```
+
+支持 `--max-budget-usd` 限制单次会话花费。
+
+---
+
+## 15. 环境变量
+
+| 变量 | 说明 | 默认 |
+|------|------|------|
+| `ANTHROPIC_API_KEY` | API 密钥 | - |
+| `BASH_MAX_OUTPUT_LENGTH` | 命令输出最大字符 | 30000 |
+| `BASH_DEFAULT_TIMEOUT_MS` | 命令默认超时 | 120000 |
+| `BASH_MAX_TIMEOUT_MS` | 命令最大超时 | 600000 |
+| `CLAUDE_CODE_DONT_INHERIT_ENV` | 不继承用户环境 | false |
+| `CLAUDE_CODE_SSE_PORT` | SSE 端口 | - |
+| `CLAUDE_CODE_COORDINATOR_MODE` | 协调器模式 | false |
+| `CLAUDE_CODE_ATTRIBUTION_HEADER` | 归因头 | - |
+| `CLAUDE_CODE_SIMPLE` | 最小模式 | - |
+| `FORCE_CODE_TERMINAL` | 强制 IDE 终端识别 | false |
+
+---
+
+## 16. 遥测事件
+
+| 事件 | 触发 |
+|------|------|
+| tengu_init | 启动（含 entrypoint, hasPrompt, model, flags） |
+| tengu_mcp_add/delete/list/get/start | MCP 操作 |
+| tengu_ext_installed/install_error | IDE 扩展 |
+| tengu_doctor_command | 健康检查 |
+| tengu_approved_tool_remove | 移除已批准工具 |
+| shell_snapshot_created/failed | Shell 环境 |
+| tengu_binary_feedback_display_decision | 反馈系统 |
+
+分析平台: GrowthBook (A/B测试) + Datadog/Statsig
+PII 脱敏: `AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS` 标记类型
