@@ -1244,7 +1244,7 @@ Scopes:
 
 ---
 
-## 8. MCP 插件协议
+## 8. MCP 插件协议（完整规格）
 
 ### 8.1 协议基础
 
@@ -1255,17 +1255,25 @@ Scopes:
 
 错误码:
   -32000 ConnectionClosed
-  -32001 RequestTimeout
+  -32001 RequestTimeout (也用于 HTTP 404 session expired)
   -32700 ParseError
   -32600 InvalidRequest
   -32601 MethodNotFound
   -32602 InvalidParams
   -32603 InternalError
-
-默认超时: 60000ms
 ```
 
-### 8.2 初始化握手
+### 8.2 超时常量
+
+| 场景 | 超时 | 配置项 |
+|------|------|--------|
+| 连接 | 30,000ms | `MCP_TIMEOUT` |
+| 单次请求 | 60,000ms | `MCP_REQUEST_TIMEOUT_MS` |
+| 工具调用 | ~27.8小时(实质无限) | `MCP_TOOL_TIMEOUT` |
+| 认证请求 | 30,000ms | `AUTH_REQUEST_TIMEOUT_MS` |
+| 认证缓存(needs-auth) | 15分钟 | `MCP_AUTH_CACHE_TTL_MS` |
+
+### 8.3 初始化握手
 
 ```
 Client → Server: initialize { protocolVersion, capabilities, clientInfo }
@@ -1273,17 +1281,195 @@ Server → Client: { protocolVersion, capabilities, serverInfo, instructions? }
 Client → Server: notifications/initialized
 ```
 
-### 8.3 能力协商
+### 8.4 能力协商
 
 ```typescript
 // 客户端能力
 { experimental?, sampling?, roots?: { listChanged? } }
 
 // 服务端能力
-{ experimental?, logging?, completions?, prompts?: { listChanged? }, resources?: { subscribe?, listChanged? }, tools?: { listChanged? } }
+{ experimental?, logging?, completions?,
+  prompts?: { listChanged? },
+  resources?: { subscribe?, listChanged? },
+  tools?: { listChanged? } }
 ```
 
-### 8.4 工具 Schema
+### 8.5 服务器状态机
+
+```
+Pending → Connected → (onerror/onclose) → Reconnect or Failed
+     ↓
+   Failed (立即)
+     ↓
+ NeedsAuth (401) → OAuth流程 → 重试连接
+     ↓
+  Disabled (用户手动禁用)
+```
+
+```typescript
+// 5 种状态
+ConnectedMCPServer  = { type: 'connected', client, capabilities, serverInfo?, instructions?, cleanup }
+FailedMCPServer     = { type: 'failed', error? }
+NeedsAuthMCPServer  = { type: 'needs-auth' }
+PendingMCPServer    = { type: 'pending', reconnectAttempt?, maxReconnectAttempts? }
+DisabledMCPServer   = { type: 'disabled' }
+```
+
+### 8.6 8 种传输实现
+
+**stdio (StdioClientTransport):**
+```
+启动子进程: command + args
+通信: stdin/stdout
+stderr: pipe模式, 最多累积 64MB
+清理: SIGINT(100ms) → SIGTERM(400ms) → SIGKILL
+```
+
+**SSE (SSEClientTransport):**
+```
+服务端→客户端: 长连接 GET (EventSource, 无超时)
+客户端→服务端: POST (60s超时)
+认证: OAuth token 自动刷新
+```
+
+**HTTP Streamable (StreamableHTTPClientTransport):**
+```
+双向 POST 轮询
+60s/请求超时
+Session ID 持久化
+404 + JSON-RPC -32001 = session expired → 重连
+```
+
+**WebSocket (WebSocketTransport):**
+```
+协议: 'mcp' subprotocol
+Bun: 原生 DOM WebSocket
+Node: ws 包动态导入
+```
+
+**SDK (InProcessTransport):**
+```
+进程内直接调用, 无子进程开销
+通过 queueMicrotask 异步传递消息
+用于 Chrome MCP, Computer Use MCP
+```
+
+### 8.7 服务配置
+
+```typescript
+type ConfigScope = 'local' | 'user' | 'project' | 'dynamic' | 'enterprise' | 'claudeai' | 'managed'
+
+// stdio
+{ type?: 'stdio', command: string, args: string[], env?: Record<string, string> }
+
+// SSE
+{ type: 'sse', url: string, headers?: Record<string, string>, oauth?: OAuthConfig }
+
+// HTTP
+{ type: 'http', url: string, headers?: Record<string, string>, oauth?: OAuthConfig }
+
+// WebSocket
+{ type: 'ws', url: string, headers?: Record<string, string> }
+
+// SDK
+{ type: 'sdk', name: string }
+
+// claude.ai proxy
+{ type: 'claudeai-proxy', url: string, id: string }
+
+// OAuth 配置
+{ clientId?: string, callbackPort?: number, authServerMetadataUrl?: string, xaa?: boolean }
+```
+
+### 8.8 配置加载优先级
+
+```
+1. Enterprise managed config
+2. Plugin-provided configs
+3. Project scope (.mcp.json)
+4. User scope (~/.claude/config.json)
+5. Local scope (~/.claude/local-settings.json)
+6. Dynamic scope (--mcp-config CLI)
+7. Claude.ai connectors (async fetch)
+
+去重: 基于内容签名(command+args 或 url), 非基于名称
+合并: 手动 > 插件; 手动(非禁用) > claude.ai
+```
+
+### 8.9 环境变量展开
+
+```
+语法: ${VAR} 或 ${VAR:-default}
+展开位置: command, args, env, url, headers
+缺失变量: 追踪并报错
+```
+
+### 8.10 企业策略
+
+```typescript
+allowedMcpServers: string[]   // 白名单(名称/命令/URL)
+deniedMcpServers: string[]    // 黑名单(优先于白名单)
+// URL 支持通配符: https://*.example.com/*
+```
+
+### 8.11 连接管理
+
+```
+本地服务(stdio/sdk): 并发上限 3 (MCP_SERVER_CONNECTION_BATCH_SIZE)
+远程服务(sse/http): 并发上限 20 (MCP_REMOTE_SERVER_CONNECTION_BATCH_SIZE)
+
+缓存: memoize by "${name}-${JSON.stringify(config)}"
+工具获取: LRU 缓存, size=20
+资源获取: LRU 缓存, size=20
+
+断连检测: ECONNRESET, ETIMEDOUT, EPIPE, EHOSTUNREACH, ECONNREFUSED
+断连重连: 3次连续终端错误后关闭传输
+
+工具描述截断: MAX_MCP_DESCRIPTION_LENGTH = 2048 字符
+```
+
+### 8.12 工具命名规范
+
+```
+前缀模式(默认): mcp__{normalizedServerName}__{normalizedToolName}
+例: mcp__github__list_issues
+
+无前缀模式: CLAUDE_AGENT_SDK_MCP_NO_PREFIX=true → 直接用 toolName
+
+名称规范化: 非字母数字/连字符/下划线 → 下划线
+           claude.ai 服务: 折叠连续下划线
+           模式: ^[a-zA-Z0-9_-]{1,64}$
+```
+
+### 8.13 MCP OAuth
+
+```
+发现链: RFC 9728 → RFC 8414 → 配置URL
+Token 存储: Keychain slot = "${serverName}|${SHA256(config).substring(0,16)}"
+
+Token 结构:
+{
+  accessToken, refreshToken?, expiresAt, scope?,
+  clientId?, clientSecret?,
+  discoveryState: { authorizationServerUrl?, resourceMetadataUrl? },
+  stepUpScope?
+}
+
+Token 撤销 (RFC 7009):
+  1. 标准: client_id in body, 无 Authorization header
+  2. 回退 401: Bearer auth (非标服务)
+  3. 先撤 refresh token, 再撤 access token
+
+XAA (Cross-App Access / SEP-990):
+  1. RFC 8693 Token Exchange: id_token → ID-JAG
+  2. RFC 7523 JWT Bearer: ID-JAG → access_token
+  单 IdP 登录复用于所有 XAA 服务器
+
+错误别名 (invalid_grant):
+  invalid_refresh_token, expired_refresh_token, token_expired
+```
+
+### 8.14 工具 Schema
 
 ```typescript
 {
@@ -1294,12 +1480,9 @@ Client → Server: notifications/initialized
 }
 ```
 
-### 8.5 服务配置
+### 8.15 服务配置（旧位置，保留兼容）
 
 ```typescript
-// 范围
-type ConfigScope = 'local' | 'user' | 'project' | 'dynamic' | 'enterprise' | 'claudeai' | 'managed'
-
 // stdio 类型
 { command: string, args?: string[], env?: Record<string, string> }
 
