@@ -635,6 +635,196 @@ System prompt 由模块化 section 组成，缓存在轮次之间（`/clear` 或
 
 ---
 
+## 4.5 对话引擎（完整规格）
+
+### QueryParams
+
+```typescript
+type QueryParams = {
+  messages: Message[]
+  systemPrompt: SystemPrompt
+  userContext: { [k: string]: string }
+  systemContext: { [k: string]: string }
+  canUseTool: CanUseToolFn
+  toolUseContext: ToolUseContext
+  fallbackModel?: string
+  querySource: QuerySource
+  maxOutputTokensOverride?: number
+  maxTurns?: number
+  skipCacheWrite?: boolean
+  taskBudget?: { total: number }
+  deps?: QueryDeps
+}
+```
+
+### 对话循环状态机（详细版）
+
+```
+queryLoop() → AsyncGenerator
+
+初始化:
+  turnCount = 1
+  maxOutputTokensRecoveryCount = 0
+  currentModel = 请求模型
+  toolUseBlocks = []
+
+每轮循环:
+  1. yield { type: 'stream_request_start' }
+  2. 检查是否需要 autoCompact (token 阈值)
+     → 是: 压缩 → yield compact_boundary 消息 → 更新消息列表
+  3. 调用 queryModelWithStreaming() (流式)
+  4. 处理流式事件:
+     → content_block_delta: yield stream_event (实时显示)
+     → tool_use block: 加入 toolUseBlocks, needsFollowUp = true
+  5. 流式结束，检查 stop_reason:
+
+     stop_reason = "end_turn":
+       → needsFollowUp = false → 结束循环
+       → 执行 post-turn hooks
+
+     stop_reason = "tool_use":
+       → 执行所有 toolUseBlocks (并发安全检查)
+       → yield tool_result 消息
+       → turnCount++
+       → 检查 maxTurns → 超限则 yield max_turns_reached → 结束
+       → 继续循环
+
+     stop_reason = "max_tokens":
+       → maxOutputTokensRecoveryCount++
+       → if count <= 3:
+           → 提升输出上限到 ESCALATED_MAX_TOKENS
+           → 追加 nudge: "Output limit hit. Resume directly..."
+           → 继续循环
+       → else: yield error
+
+     API 错误 413 (prompt_too_long):
+       → 尝试 collapse drain
+       → 回退: reactive compact (分组截断最老的消息)
+       → MAX_PTL_RETRIES = 3
+
+     API 错误 429/529 (过载):
+       → 重试(指数退避)
+       → 连续 529 超 3 次 → FallbackTriggeredError
+       → 切换到 fallbackModel → yield 警告 → 继续循环
+```
+
+### 消息类型
+
+```typescript
+// 用户消息
+SDKUserMessage = {
+  type: 'user'
+  message: APIUserMessage    // content blocks (text, image, etc.)
+  parent_tool_use_id: string | null
+  uuid: string
+  session_id: string
+  timestamp: ISO8601
+}
+
+// AI 消息
+SDKAssistantMessage = {
+  type: 'assistant'
+  message: APIAssistantMessage  // content blocks (text, tool_use, thinking)
+  parent_tool_use_id: string | null
+  error?: 'authentication_failed' | 'billing_error' | 'rate_limit'
+        | 'invalid_request' | 'server_error' | 'max_output_tokens'
+  uuid: string
+  session_id: string
+}
+
+// 压缩边界
+CompactBoundaryMessage = {
+  type: 'system'
+  subtype: 'compact_boundary'
+  compact_metadata: {
+    trigger: 'manual' | 'auto'
+    pre_tokens: number
+    preserved_segment?: { head_uuid, anchor_uuid, tail_uuid }
+  }
+}
+
+// 内容块类型
+ContentBlock =
+  | { type: 'text', text: string }
+  | { type: 'tool_use', id: string, name: string, input: Record }
+  | { type: 'tool_result', tool_use_id: string, content: string }
+  | { type: 'thinking', thinking: string }
+  | { type: 'redacted_thinking' }
+```
+
+### Token 预算
+
+```typescript
+// 阈值
+COMPLETION_THRESHOLD = 0.9    // 预算用了90%考虑停止
+DIMINISHING_THRESHOLD = 500   // 每轮增量低于500 = 收益递减
+
+// 判断逻辑
+type BudgetTracker = {
+  continuationCount: number
+  lastDeltaTokens: number
+  lastGlobalTurnTokens: number
+  startedAt: number  // ms
+}
+
+// 决策:
+// if turnTokens < budget * 0.9 && !isDiminishing → continue (追加nudge)
+// isDiminishing = continuationCount >= 3 && 最近两轮 delta < 500
+// else → stop
+```
+
+### API 客户端
+
+```
+端点: POST /v1/messages?beta=true
+超时: 流式 600,000ms / 非流式 300,000ms (远程 120,000ms)
+
+Beta headers:
+  - CONTEXT_1M_BETA_HEADER (1M上下文)
+  - FAST_MODE_BETA_HEADER
+  - PROMPT_CACHING_SCOPE_BETA_HEADER
+  - TASK_BUDGETS_BETA_HEADER
+  - EFFORT_BETA_HEADER
+
+错误重试:
+  429 → 指数退避重试
+  502/503/504 → 自动重试
+  529 → 最多3次，超限触发模型降级
+  413 → 压缩上下文后重试(最多3次)
+
+模型降级流程:
+  1. 主模型连续 429/529 超限
+  2. 抛出 FallbackTriggeredError
+  3. 切换 currentModel = fallbackModel
+  4. 清除待执行工具
+  5. 剥离 thinking blocks (签名与模型绑定)
+  6. yield 用户可见警告
+  7. 用备用模型重试
+```
+
+### 思考模式 (Extended Thinking)
+
+```typescript
+type ThinkingConfig =
+  | { type: 'adaptive' }     // AI自行决定是否思考
+  | { type: 'disabled' }     // 关闭思考
+  | { type: 'enabled', maxTokens?: number }  // 强制思考
+
+默认: 如果模型支持 → adaptive
+CLI参数: --thinking enabled|adaptive|disabled
+```
+
+### maxTurns 限制
+
+```
+--max-turns N (print模式)
+
+turnCount 从 1 开始，每次 tool_use 后 +1
+超过 N → yield max_turns_reached attachment → 返回 { reason: 'max_turns' }
+```
+
+---
+
 ## 5. 权限系统（完整规格）
 
 ### 5.1 权限模式
