@@ -483,13 +483,29 @@ System prompt 由模块化 section 组成，缓存在轮次之间（`/clear` 或
 
 ---
 
-## 5. 权限系统
+## 5. 权限系统（完整规格）
 
 ### 5.1 权限模式
 
 ```typescript
-type PermissionMode = 'default' | 'plan' | 'acceptEdits' | 'dontAsk' | 'bypassPermissions' | 'auto'
+// 外部模式（用户可选）
+type ExternalPermissionMode = 'acceptEdits' | 'bypassPermissions' | 'default' | 'dontAsk' | 'plan'
+
+// 内部模式（含实验功能）
+type InternalPermissionMode = ExternalPermissionMode | 'auto' | 'bubble'
+
+type PermissionMode = InternalPermissionMode
 ```
+
+| 模式 | 行为 |
+|------|------|
+| default | 只读操作自动放行，写入操作需确认 |
+| plan | AI 只能读不能写（进入计划模式前的 mode 记录在 prePlanMode） |
+| acceptEdits | 文件编辑自动放行（在工作目录内） |
+| dontAsk | 需确认的操作直接拒绝（不弹框） |
+| bypassPermissions | 跳过所有检查（仅限 Docker 无网络环境） |
+| auto | 用 ML 分类器自动判断（实验性） |
+| bubble | 权限请求冒泡到父级（内部用） |
 
 ### 5.2 权限行为
 
@@ -497,30 +513,285 @@ type PermissionMode = 'default' | 'plan' | 'acceptEdits' | 'dontAsk' | 'bypassPe
 type PermissionBehavior = 'allow' | 'ask' | 'deny'
 ```
 
-### 5.3 权限规则结构
+### 5.3 核心类型定义
 
 ```typescript
-interface PermissionRule {
-  source: 'userSettings' | 'projectSettings' | 'localSettings' | 'flagSettings' | 'policySettings' | 'cliArg' | 'command' | 'session'
+// 规则来源
+type PermissionRuleSource =
+  | 'userSettings'      // ~/.claude/settings.json
+  | 'projectSettings'   // .claude/settings.json
+  | 'localSettings'     // .claude/.local/settings.json
+  | 'flagSettings'      // CLI --settings 参数
+  | 'policySettings'    // 企业管理策略
+  | 'cliArg'            // CLI 参数
+  | 'command'           // 命令级
+  | 'session'           // 会话级（内存，不持久化）
+
+// 规则结构
+type PermissionRule = {
+  source: PermissionRuleSource
   ruleBehavior: 'allow' | 'deny' | 'ask'
   ruleValue: { toolName: string, ruleContent?: string }
 }
+
+// 规则更新操作
+type PermissionUpdate =
+  | { type: 'addRules'; destination: PermissionUpdateDestination; rules: PermissionRuleValue[]; behavior: PermissionBehavior }
+  | { type: 'replaceRules'; destination: PermissionUpdateDestination; rules: PermissionRuleValue[]; behavior: PermissionBehavior }
+  | { type: 'removeRules'; destination: PermissionUpdateDestination; rules: PermissionRuleValue[]; behavior: PermissionBehavior }
+  | { type: 'setMode'; destination: PermissionUpdateDestination; mode: ExternalPermissionMode }
+  | { type: 'addDirectories'; destination: PermissionUpdateDestination; directories: string[] }
+  | { type: 'removeDirectories'; destination: PermissionUpdateDestination; directories: string[] }
 ```
 
-### 5.4 判断流程
+### 5.4 权限决策类型
+
+```typescript
+type PermissionAllowDecision = {
+  behavior: 'allow'
+  updatedInput?: Input
+  userModified?: boolean
+  decisionReason?: PermissionDecisionReason
+  toolUseID?: string
+  acceptFeedback?: string
+  contentBlocks?: ContentBlockParam[]
+}
+
+type PermissionAskDecision = {
+  behavior: 'ask'
+  message: string
+  updatedInput?: Input
+  suggestions?: PermissionUpdate[]    // 给用户的建议规则（如"始终允许npm:*"）
+  blockedPath?: string
+  metadata?: { command: PermissionCommandMetadata }
+  pendingClassifierCheck?: PendingClassifierCheck
+  contentBlocks?: ContentBlockParam[]
+}
+
+type PermissionDenyDecision = {
+  behavior: 'deny'
+  message: string
+  decisionReason: PermissionDecisionReason
+  toolUseID?: string
+}
+
+// 决策原因（全部枚举）
+type PermissionDecisionReason =
+  | { type: 'rule'; rule: PermissionRule }
+  | { type: 'mode'; mode: PermissionMode }
+  | { type: 'subcommandResults'; reasons: Map<string, PermissionResult> }
+  | { type: 'permissionPromptTool'; permissionPromptToolName: string; toolResult: unknown }
+  | { type: 'hook'; hookName: string; hookSource?: string; reason?: string }
+  | { type: 'asyncAgent'; reason: string }
+  | { type: 'sandboxOverride'; reason: 'excludedCommand' | 'dangerouslyDisableSandbox' }
+  | { type: 'classifier'; classifier: string; reason: string }
+  | { type: 'workingDir'; reason: string }
+  | { type: 'safetyCheck'; reason: string; classifierApprovable: boolean }
+  | { type: 'other'; reason: string }
+```
+
+### 5.5 完整判断状态机（6步）
 
 ```
-工具调用 → 匹配规则
-  1. deny 规则优先级最高
-  2. policySettings(企业) > cliArg > session > user > project > local
-  3. auto模式 → 调用 YOLO 分类器
-     → 两阶段: fast(tool_use) + thinking(XML)
-     → 返回 { shouldBlock, reason, thinking }
-  4. ask → 渲染确认 UI → [允许/拒绝/始终允许]
-  5. 重复拒绝追踪: 达阈值后降级为提示
+hasPermissionsToUseTool(tool, input, context) → PermissionDecision
+
+STEP 1: 规则匹配（绕过免疫）
+  1a. deny 规则命中 → 直接拒绝
+  1b. ask 规则命中 → 标记需确认
+  1c. 工具自身 checkPermissions() → 可能 allow/deny/ask/passthrough
+  1d. 安全硬编码检查（.git/, .claude/, .bashrc 等）
+      - classifierApprovable=false → 必须人工确认（连 auto 模式也绕不过）
+      - classifierApprovable=true → auto 模式的分类器可以放行
+
+STEP 2: 模式覆盖
+  2a. bypassPermissions → 直接允许
+  2b. 整个工具有 allow 规则 → 直接允许
+
+STEP 3: passthrough → ask（默认转为需确认）
+
+STEP 4: auto 模式分类器（如果 behavior=ask 且 mode=auto）
+  快速路径:
+    - acceptEdits 模式也允许? → 跳过分类器
+    - 工具在安全白名单? → 跳过分类器
+  慢速路径:
+    - 格式化动作 → 构建转录文本 → 调用分类器
+    - 分类器返回 shouldBlock:
+      true → 记录拒绝 → 检查熔断 → 可能降级为提示
+      false → 记录成功 → 允许
+
+STEP 5: dontAsk 模式转换
+  如果 behavior=ask && mode=dontAsk → 转为 deny
+
+STEP 6: 无头 Agent 处理
+  如果 behavior=ask && shouldAvoidPermissionPrompts:
+    → 执行 PermissionRequest hooks
+    → 无 hook 决定 → 自动拒绝
 ```
 
-### 5.5 文件状态追踪
+### 5.6 ML 分类器（YOLO Classifier）
+
+```typescript
+// 分类器结果
+type YoloClassifierResult = {
+  thinking?: string
+  shouldBlock: boolean
+  reason: string
+  unavailable?: boolean
+  model: string
+  usage?: ClassifierUsage
+  durationMs?: number
+  stage?: 'fast' | 'thinking'     // 两阶段标记
+  // 第一阶段指标
+  stage1Usage?: ClassifierUsage
+  stage1DurationMs?: number
+  stage1RequestId?: string
+  // 第二阶段指标
+  stage2Usage?: ClassifierUsage
+  stage2DurationMs?: number
+  stage2RequestId?: string
+}
+
+type ClassifierUsage = {
+  inputTokens: number
+  outputTokens: number
+  cacheReadInputTokens: number
+  cacheCreationInputTokens: number
+}
+```
+
+**两阶段设计:**
+```
+Stage 1 ("fast", tool_use mode):
+  - 后缀指令: "Err on the side of blocking. <block> immediately."
+  - 快速决策，偏向保守
+
+Stage 2 ("thinking", extended thinking mode):
+  - 后缀指令: "Review the classification process carefully... Use <thinking> before responding with <block>."
+  - 详细推理，更准确
+
+输出格式 (XML):
+  <block>yes</block> 或 <block>no</block>
+  <reason>解释...</reason>
+  <thinking>推理过程...</thinking>  (仅 stage 2)
+```
+
+**分类器输入:**
+- System Prompt: 基础模板 + 权限模板 + 用户 autoMode 配置
+- Messages: CLAUDE.md(带缓存控制) + 对话转录(仅用户文本+工具调用) + 当前待分类动作
+
+### 5.7 拒绝追踪与熔断
+
+```typescript
+const DENIAL_LIMITS = {
+  maxConsecutive: 3,   // 连续被分类器拒绝3次 → 降级为用户提示
+  maxTotal: 20,        // 累计被拒绝20次 → 降级为用户提示
+}
+
+type DenialTrackingState = {
+  consecutiveDenials: number  // 允许后重置为0
+  totalDenials: number        // 不重置
+}
+
+// shouldFallbackToPrompting() = consecutiveDenials >= 3 || totalDenials >= 20
+```
+
+### 5.8 文件权限判断（checkWritePermissionForTool）
+
+```
+Step 1: 检查 deny 规则
+Step 1.5: 允许内部可编辑路径（plan 文件、scratchpad）
+Step 1.6: 检查 .claude/** session 级 allow 规则
+Step 1.7: 安全硬编码检查（绕过免疫）
+Step 2: 检查 ask 规则
+Step 3: acceptEdits 模式 + 在工作目录内 → allow
+Step 4: 检查 allow 规则
+Step 5: 默认 → ask
+```
+
+**安全硬编码保护列表:**
+```typescript
+// 危险文件（始终需确认）
+DANGEROUS_FILES = [
+  '.gitconfig', '.gitmodules', '.bashrc', '.bash_profile',
+  '.zshrc', '.zprofile', '.profile', '.ripgreprc',
+  '.mcp.json', '.claude.json'
+]
+
+// 危险目录（始终需确认）
+DANGEROUS_DIRECTORIES = ['.git', '.vscode', '.idea', '.claude']
+
+// Windows 可疑路径模式（始终需确认）
+- NTFS 替代数据流 (path 含 ':' 在位置2之后)
+- 8.3 短文件名 (含 '~\d')
+- 长路径前缀 ('\\?\', '\\.\')
+- 尾部点/空格
+- DOS 设备名 (CON, PRN, AUX, NUL, COM1-9, LPT1-9)
+- UNC 路径 ('\\server\share')
+```
+
+### 5.9 权限上下文
+
+```typescript
+type ToolPermissionContext = {
+  mode: PermissionMode
+  additionalWorkingDirectories: ReadonlyMap<string, AdditionalWorkingDirectory>
+  alwaysAllowRules: ToolPermissionRulesBySource
+  alwaysDenyRules: ToolPermissionRulesBySource
+  alwaysAskRules: ToolPermissionRulesBySource
+  isBypassPermissionsModeAvailable: boolean
+  shouldAvoidPermissionPrompts?: boolean        // 无头Agent
+  awaitAutomatedChecksBeforeDialog?: boolean
+  prePlanMode?: PermissionMode                  // plan模式前的模式
+}
+
+type ToolPermissionRulesBySource = {
+  [T in PermissionRuleSource]?: string[]
+}
+```
+
+### 5.10 规则加载与优先级
+
+```
+加载顺序: userSettings → projectSettings → localSettings → flagSettings → policySettings
+
+如果 allowManagedPermissionRulesOnly=true:
+  → 只加载 policySettings，忽略其他所有来源
+  → UI 隐藏"始终允许"选项
+  → 会话级选项仍然可用
+
+规则匹配优先级: deny > ask > allow（deny 总是赢）
+```
+
+### 5.11 审批 UI 选项
+
+**Bash 命令审批:**
+```
+[1] Yes                                     // 允许一次
+[2] Yes, and don't ask again for [prefix]   // 持久化 allow 规则
+[3] Yes, during this session                // 会话级 allow
+[4] No                                      // 拒绝（可附反馈）
+```
+
+**文件操作审批:**
+```
+[1] Yes                                     // 允许一次
+[2] Yes, allow all edits during session     // 会话级 allow
+[3] No                                      // 拒绝
+```
+
+**特殊: .claude/ 目录操作:**
+```
+[1] Yes
+[2] Yes, allow Claude to edit settings for this session only  // 仅会话级
+[3] No
+```
+
+**企业模式 (allowManagedPermissionRulesOnly=true):**
+- 隐藏所有持久化 "always allow" 选项
+- 保留会话级选项
+- 企业规则显示🔒图标，不可删除
+
+### 5.12 文件状态追踪
 
 ```typescript
 // 全局 Map
