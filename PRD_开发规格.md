@@ -1501,7 +1501,7 @@ XAA (Cross-App Access / SEP-990):
 
 ---
 
-## 9. 多智能体协调器
+## 9. 多智能体协调器（完整规格）
 
 ### 9.1 启用方式
 ```
@@ -1511,27 +1511,58 @@ XAA (Cross-App Access / SEP-990):
 ### 9.2 工作流
 ```
 Research(调研) → Synthesis(综合) → Implementation(执行) → Verification(验证)
+
+并发规则:
+  调研阶段: 多工人并行
+  综合阶段: 协调器独占(读取所有工人结果)
+  执行阶段: 同文件串行，不同文件可并行
+  验证阶段: 可与执行并行(不同区域)
 ```
 
 ### 9.3 工具分配
 ```
-协调器专属: TeamCreate, TeamDelete, SendMessage, SyntheticOutput
-工人可用: Bash, FileRead, FileEdit, MCP tools, Skills
+协调器专属(INTERNAL_WORKER_TOOLS):
+  TeamCreate, TeamDelete, SendMessage, SyntheticOutput
+
+工人可用(ASYNC_AGENT_ALLOWED_TOOLS):
+  简单模式(CLAUDE_CODE_SIMPLE): Bash, Read, Edit
+  完整模式: Read, Edit, Write, Grep, Glob, Bash, WebSearch, WebFetch,
+            NotebookEdit, Skill, ToolSearch, SyntheticOutput, Worktree
+
+子智能体禁用:
+  TaskOutput, ExitPlanMode, EnterPlanMode, AskUserQuestion, TaskStop
 ```
 
 ### 9.4 并发规则
 - 读操作: 可并行
 - 写操作: 必须串行
 
-### 9.5 后台任务类型
+### 9.5 后台任务类型与状态机
+```typescript
+// 7 种任务类型
+type TaskType = 'local_bash' | 'local_agent' | 'remote_agent'
+             | 'in_process_teammate' | 'local_workflow'
+             | 'monitor_mcp' | 'dream'
+
+// 任务状态机
+pending → running → completed
+       ↘         ↗
+         failed / killed
 ```
-LocalShellTask      - 命令执行
-LocalAgentTask      - 本地子智能体
-RemoteAgentTask     - 远程子智能体
-InProcessTeammateTask - 进程内队友
-LocalWorkflowTask   - 工作流
-MonitorMcpTask      - MCP监控
-DreamTask           - 后台任务
+
+### 9.6 工人结果格式
+```xml
+<task-notification>
+  <task-id>{agentId}</task-id>
+  <status>completed|failed|killed</status>
+  <summary>human-readable status</summary>
+  <result>agent's final text response</result>
+  <usage>
+    <total_tokens>N</total_tokens>
+    <tool_uses>N</tool_uses>
+    <duration_ms>N</duration_ms>
+  </usage>
+</task-notification>
 ```
 
 ---
@@ -1603,30 +1634,76 @@ type: user | feedback | project | reference
 
 ---
 
-## 12. IDE 桥接
+## 12. IDE 桥接（完整规格）
 
 ### 12.1 架构
 ```
-终端 Claude Code ←→ Bridge (SSE/WebSocket) ←→ IDE 扩展
+终端 Claude Code ←JWT→ Bridge API ←SSE/WS→ IDE 扩展
 ```
 
-### 12.2 VS Code
-- 扩展 ID: `anthropic.claude-code`
-- 安装: 内嵌 .vsix，`code --install-extension`
+### 12.2 支持的 IDE（18 种）
+```typescript
+type IdeType =
+  | 'vscode' | 'cursor' | 'windsurf'          // VS Code 系
+  | 'pycharm' | 'intellij' | 'webstorm'       // JetBrains 系
+  | 'phpstorm' | 'rubymine' | 'clion'
+  | 'goland' | 'rider' | 'datagrip'
+  | 'appcode' | 'dataspell' | 'aqua'
+  | 'gateway' | 'fleet' | 'androidstudio'
 
-### 12.3 JetBrains
-- 内嵌 JAR 插件包
-- 支持: PyCharm, IntelliJ, WebStorm, GoLand, Rider 等
+// 检测方式: 进程关键词匹配
+// macOS: 'Visual Studio Code', 'Code Helper', 'Cursor.app' 等
+// Windows: 'code.exe', 'cursor.exe' 等
+// Linux: 'code', 'cursor' 等
+```
 
-### 12.4 连接
-- 认证: JWT Token
-- 重连: 指数退避 2s→120s→600s
-- 状态轮询: 1s 间隔
-- 多会话支持
+### 12.3 连接管理
+```typescript
+// 退避策略
+DEFAULT_BACKOFF = {
+  connInitialMs: 2_000,        // 首次连接重试
+  connCapMs: 120_000,          // 最大连接重试间隔 (2分钟)
+  connGiveUpMs: 600_000,       // 放弃连接 (10分钟)
+  generalInitialMs: 500,       // 一般错误退避
+  generalCapMs: 30_000,        // 一般错误上限 (30秒)
+  generalGiveUpMs: 600_000,    // 一般错误放弃 (10分钟)
+}
+
+// 轮询错误
+POLL_ERROR_INITIAL_DELAY_MS = 2_000
+POLL_ERROR_MAX_DELAY_MS = 60_000
+POLL_ERROR_GIVE_UP_MS = 15 * 60 * 1000  // 15分钟
+
+// JWT Token 刷新
+TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000        // 过期前5分钟
+FALLBACK_REFRESH_INTERVAL_MS = 30 * 60 * 1000  // 未知过期时30分钟
+MAX_REFRESH_FAILURES = 3                        // 连续失败3次放弃
+REFRESH_RETRY_DELAY_MS = 60_000                 // 重试间隔60秒
+```
+
+### 12.4 会话管理
+```typescript
+// 活跃会话追踪
+activeSessions: Map<sessionId, SessionHandle>
+sessionStartTimes: Map<sessionId, timestamp>
+sessionWorkIds: Map<sessionId, workId>
+sessionIngressTokens: Map<sessionId, jwt>
+sessionWorktrees: Map<sessionId, { worktreePath, worktreeBranch?, gitRoot? }>
+
+// 心跳返回值
+'ok' | 'auth_failed' | 'fatal' | 'failed'
+// auth_failed(401/403) → 重新认证
+// fatal(404/410) → 环境已过期
+```
+
+### 12.5 桥接状态
+```typescript
+type BridgeState = 'ready' | 'connected' | 'reconnecting' | 'failed'
+```
 
 ---
 
-## 13. 语音模式
+## 13. 语音模式（完整规格）
 
 ```
 平台:
@@ -1638,34 +1715,65 @@ type: user | feedback | project | reference
   声道: 1 (单声道)
   静默检测: 2秒无声停止, 阈值 3%
 
-流程: 按键录音 → 流式STT → 文本输入
+启用条件 (ALL must be true):
+  1. GrowthBook: tengu_amber_quartz_disabled !== true (紧急开关)
+  2. 认证: 必须是 Anthropic OAuth (不支持 API Key 或 Bedrock/Vertex)
+  3. Scope: 需要 user:inference
+
+流程: 按键录音 → 流式STT(claude.ai) → 文本输入
 ```
 
 ---
 
-## 14. 费用追踪
+## 14. 费用追踪（完整规格）
 
 ```typescript
-interface CostState {
+type StoredCostState = {
   totalCostUSD: number
   totalAPIDuration: number
   totalAPIDurationWithoutRetries: number
   totalToolDuration: number
   totalLinesAdded: number
   totalLinesRemoved: number
-  modelUsage: {
+  lastDuration?: number
+  modelUsage?: {
     [modelName: string]: {
       inputTokens: number
       outputTokens: number
-      cacheReadTokens: number
-      cacheCreationTokens: number
-      cost: number
+      cacheReadInputTokens: number
+      cacheCreationInputTokens: number
+      webSearchRequests: number
+      costUSD: number
+      contextWindow: number
+      maxOutputTokens: number
     }
   }
 }
 ```
 
-支持 `--max-budget-usd` 限制单次会话花费。
+### 14.1 费用计算流程
+```
+API 响应 → 提取 usage 字段 → calculateUSDCost(model, usage) → 累加到 CostState
+  → 按模型分别记录 token 消耗
+  → 发送到 OpenTelemetry counter
+  → 检查 advisor 嵌套调用的额外费用
+```
+
+### 14.2 预算强制 (--max-budget-usd)
+```
+CLI: --max-budget-usd <amount> (float, > 0)
+传递: toolUseContext.options.maxBudgetUsd
+注入到 AI 上下文:
+  "Total budget: $X, Used: $Y, Remaining: $(X-Y)"
+工具执行层检查: 超预算则停止
+```
+
+### 14.3 费用持久化
+```
+保存: saveCurrentSessionCosts() → 项目配置
+恢复: restoreCostStateForSession(sessionId) → 仅当 lastSessionId 匹配
+包含: 费用、时长、行数变更、模型使用量、FPS 指标
+```
 
 ---
 
@@ -1686,17 +1794,203 @@ interface CostState {
 
 ---
 
-## 16. 遥测事件
+## 16. 遥测事件（完整规格）
 
-| 事件 | 触发 |
-|------|------|
-| tengu_init | 启动（含 entrypoint, hasPrompt, model, flags） |
-| tengu_mcp_add/delete/list/get/start | MCP 操作 |
-| tengu_ext_installed/install_error | IDE 扩展 |
-| tengu_doctor_command | 健康检查 |
-| tengu_approved_tool_remove | 移除已批准工具 |
-| shell_snapshot_created/failed | Shell 环境 |
-| tengu_binary_feedback_display_decision | 反馈系统 |
+### 16.1 核心事件（180+ 个，按类别列出关键事件）
 
-分析平台: GrowthBook (A/B测试) + Datadog/Statsig
-PII 脱敏: `AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS` 标记类型
+**认证:**
+```
+tengu_oauth_flow_start, tengu_oauth_success, tengu_oauth_token_exchange_success
+tengu_oauth_token_refresh_success/failure, tengu_oauth_auth_code_received{automatic}
+tengu_oauth_api_key{status, statusCode}, tengu_oauth_roles_stored{org_role}
+```
+
+**费用/使用:**
+```
+tengu_advisor_tool_token_usage{model, tokens, cost_usd_micros}
+tengu_max_tokens_escalate, tengu_token_budget_completed
+tengu_api_success, tengu_api_error
+```
+
+**工具/权限:**
+```
+tengu_tool_use_success/error/cancelled
+tengu_auto_mode_outcome, tengu_auto_mode_denial_limit_exceeded
+```
+
+**技能/插件:**
+```
+tengu_dynamic_skills_changed{skill_name, change_type}
+tengu_skill_loaded, tengu_skill_tool_invocation
+tengu_plugin_install/uninstall_command, tengu_marketplace_added/removed
+```
+
+**会话/查询:**
+```
+tengu_started, tengu_query_before/after_attachments
+tengu_context_window_exceeded, tengu_context_size
+tengu_compact/compact_failed, tengu_model_fallback_triggered
+```
+
+### 16.2 分析平台
+- **GrowthBook**: A/B 测试 + 功能开关
+  - 磁盘缓存: `~/.claude/.growthbook-cache.json`
+  - 会话内存缓存
+  - 新安装使用默认值（不依赖服务端）
+- **Datadog/Statsig**: 运营分析
+- **OpenTelemetry**: 费用/token 指标
+
+### 16.3 PII 保护
+- 类型标记: `AnalyticsMetadata_I_VERIFIED_THIS_IS_NOT_CODE_OR_FILEPATHS`
+- 只发送: 模型名、token 数、时长、退出码
+- 不发送: 邮箱、文件路径、代码内容
+
+---
+
+## 17. 设置系统（完整规格）
+
+### 17.1 设置来源优先级（6层）
+```
+1. Plugin base (最低)
+2. User: ~/.claude/settings.json
+3. Project: .claude/settings.json
+4. Local: .claude/settings.local.json
+5. Flag: --settings CLI 参数 或 CLAUDE_CODE_FLAG_SETTINGS_PATH
+6. Policy (最高):
+   - Remote: 企业 MDM 同步
+   - macOS: /Library/Managed Preferences/ plist
+   - Windows: HKLM registry + HKCU fallback
+   - File: .claude/managed-settings.json + .claude/managed-settings.d/*.json
+```
+
+### 17.2 关键设置字段
+```typescript
+// API & 认证
+apiKeyHelper?, awsCredentialExport?, gcpAuthRefresh?
+
+// 文件
+fileSuggestion?: { type: 'command', command }
+respectGitignore?: boolean
+cleanupPeriodDays?: number
+
+// 环境
+env?: Record<string, string>
+
+// 模型
+model?, availableModels?, modelOverrides?
+
+// 权限
+permissions?: { allow: string[], deny: string[], ask: string[] }
+
+// MCP
+enableAllProjectMcpServers?, enabledMcpjsonServers?
+allowedMcpServers?, deniedMcpServers?
+
+// Hooks
+hooks?: { PreToolUse, PostToolUse, Notification, SessionStart, SessionEnd, Stop, ... }
+disableAllHooks?: boolean
+allowManagedHooksOnly?: boolean
+
+// 企业管控
+allowManagedPermissionRulesOnly?: boolean
+strictPluginOnlyCustomization?: boolean | string[]
+
+// 其他
+defaultShell?: 'bash' | 'powershell'
+attribution?: { commit?, pr? }
+worktree?: { symlinkDirectories, sparsePaths }
+statusLine?: boolean
+```
+
+### 17.3 设置校验
+- Zod schema 校验: `SettingsSchema().safeParse(data)`
+- 无效权限规则: 校验前过滤
+- 缺失设置: 返回 null（部分读取降级）
+- 会话级缓存: 启动时解析一次，需重启生效
+
+---
+
+## 18. 技能系统（完整规格）
+
+### 18.1 技能文件格式
+```yaml
+---
+name: "Display Name"
+description: "Short description"
+when_to_use: "When this skill is relevant"
+version: "1.0.0"
+model: "claude-opus-4-6" | "inherit"
+user-invocable: true | false
+allowed-tools: [Read, Grep, Glob]
+argument-hint: "argument help text"
+arguments: ["arg1", "arg2"] | "single-arg"
+effort: "low" | "medium" | "high" | 1-10
+context: "fork"              # fork = 在子智能体中执行
+agent: "agent-name"
+shell: "bash" | "powershell"
+paths: "/path/**"            # 适用路径 glob
+hooks:
+  PreToolUse: [...]
+  PostToolUse: [...]
+---
+
+Markdown prompt content...
+(${CLAUDE_SKILL_DIR} 展开为技能文件目录)
+```
+
+### 18.2 技能来源（6层，后覆盖前）
+```
+bundled < managed < plugin < projectSettings < userSettings < mcp
+```
+
+### 18.3 技能发现路径
+```
+用户: ~/.claude/skills/
+项目: .claude/skills/
+本地: .claude/skills/ (.gitignore'd)
+管理: 企业策略目录
+插件: 通过 plugin.json
+MCP: 通过 MCP server resources 端点
+```
+
+### 18.4 去重
+- 通过 `realpath()` 解析符号链接到规范路径
+- 同路径不重复加载
+
+---
+
+## 19. Vim 模式（完整规格）
+
+### 19.1 状态机
+```
+INSERT: { mode: 'INSERT', insertedText }
+NORMAL: { mode: 'NORMAL', command: CommandState }
+  CommandState:
+    idle → count → operator → operatorCount → operatorFind → operatorTextObj
+                ↘ find → g → operatorG → replace → indent
+```
+
+### 19.2 支持的操作
+```
+Operators: d(删除), c(修改), y(复制)
+Motions: h, l, j, k, w, b, e, W, B, E, 0, ^, $, G
+Find: f, F, t, T (查找字符)
+Text Objects: i/a + w/W/"/'/`/(/)/[/]/{/}/</>
+行操作: dd, cc, yy, >>, <<
+字符操作: x(删字符), r(替换字符), ~(大小写切换)
+粘贴: p, P (自动检测行/字符模式)
+行操作: J(合并行), o/O(新行)
+重复: .(dot repeat，记录并重放上次操作)
+寄存器: 无名寄存器存储最近删除/复制内容
+查找重复: ;(重复上次 f/F/t/T)
+```
+
+### 19.3 RecordedChange (dot repeat 记录)
+```typescript
+type RecordedChange =
+  | { type: 'insert', text }
+  | { type: 'operator', op, motion, count }
+  | { type: 'operatorTextObj', op, scope, objType, count }
+  | { type: 'operatorFind', op, find, char, count }
+  | { type: 'replace' | 'x' | 'toggleCase' | 'indent' | 'openLine' | 'join', ... }
+```
