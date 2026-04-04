@@ -438,6 +438,158 @@ EnterPlanMode: {} (无参数)
 ExitPlanMode: { allowedPrompts?: Array<{tool, prompt}> }
 ```
 
+### 3.3 工具架构（生命周期、延迟加载、并发、截断）
+
+#### Tool 基础接口
+
+```typescript
+type Tool<Input, Output, Progress> = {
+  name: string
+  description(input, options): Promise<string>   // 给AI的说明
+  prompt(options): Promise<string>               // 给AI的详细用法
+  inputSchema: ZodSchema                         // 输入校验(Zod)
+  outputSchema?: ZodSchema                       // 输出校验
+  call(args, context): Promise<ToolResult>       // 执行逻辑
+
+  // 属性
+  isReadOnly(input): boolean                     // 是否只读
+  isConcurrencySafe(input): boolean              // 能否并发（默认false）
+  isEnabled(): boolean                           // 是否启用
+  isDestructive?(input): boolean                 // 是否破坏性操作
+  shouldDefer?: boolean                          // 是否延迟加载
+  alwaysLoad?: boolean                           // 强制始终加载
+  maxResultSizeChars: number                     // 输出截断上限
+  searchHint?: string                            // 工具搜索描述
+  strict?: boolean                               // 严格schema校验
+
+  // MCP
+  isMcp?: boolean
+  mcpInfo?: { serverName: string; toolName: string }
+
+  // 权限
+  checkPermissions(input, context): Promise<PermissionResult>
+  validateInput?(input): ValidationResult
+
+  // UI渲染
+  renderToolUseMessage(input, options): ReactNode    // 调用时显示
+  renderToolResultMessage?(output, options): ReactNode  // 结果显示
+  renderToolUseProgressMessage?(progress, options): ReactNode  // 执行中显示
+
+  // API映射
+  mapToolResultToToolResultBlockParam(result, toolUseId): ToolResultBlock
+}
+```
+
+#### 工具生命周期（14步）
+
+```
+1. 定义 → buildTool() + lazySchema()
+2. 注册 → getAllBaseTools() (条件导入，功能开关控制)
+3. 组装 → assembleToolPool() (内置 + MCP 合并 + 去重)
+4. 过滤 → filterToolsByDenyRules() (权限规则剔除)
+5. 延迟检测 → shouldDefer / alwaysLoad 判断
+6. Schema 渲染 → renderToolDefinition() (加 defer_loading 标记)
+7. API 传输 → tools 字段发送给 Anthropic API
+8. 发现 → ToolSearchTool (延迟工具按需搜索)
+9. 执行 → StreamingToolExecutor (并发模型)
+10. 权限 → validateInput() → checkPermissions() → hooks
+11. 结果处理 → processToolResultBlock()
+12. 大结果持久化 → maybePersistLargeToolResult()
+13. 预算强制 → enforceToolResultBudget() (每消息上限)
+14. 渲染 → renderToolResultMessage()
+```
+
+#### 延迟加载（Tool Search）
+
+```typescript
+// 判断是否延迟
+function isDeferredTool(tool: Tool): boolean {
+  return tool.shouldDefer === true
+    || (tool.isMcp && !tool.alwaysLoad)
+    || isToolSearchEnabled() // 延迟工具说明超过上下文窗口10%
+}
+
+// 延迟工具列表（23个）:
+// TaskGetTool, NotebookEditTool, AskUserQuestionTool, ExitPlanModeTool,
+// WebFetchTool, TaskUpdateTool, WebSearchTool, EnterPlanModeTool,
+// TeamCreateTool, TaskCreateTool, SendMessageTool, CronCreateTool,
+// CronDeleteTool, CronListTool, TaskStopTool, ReadMcpResourceTool,
+// TeamDeleteTool, TaskOutputTool, ListMcpResourcesTool, TodoWriteTool,
+// ToolSearchTool, ExitWorktreeTool + 所有MCP工具(默认)
+
+// API 发送时:
+schema.defer_loading = true  // 延迟工具不发完整schema
+```
+
+#### 并发执行模型
+
+```
+StreamingToolExecutor:
+  - isConcurrencySafe=true 的工具 → 可并行
+  - isConcurrencySafe=false 的工具 → 独占执行
+  - 执行顺序: 排队制，结果按接收顺序 emit
+  - 错误处理: Bash 出错 → 同批次兄弟工具立即终止
+
+并发安全工具:
+  GlobTool, GrepTool, FileReadTool, WebSearchTool,
+  TaskListTool, TaskGetTool, ConfigTool(读),
+  ListMcpResourcesTool, ReadMcpResourceTool,
+  BriefTool, LSPTool, ToolSearchTool, RemoteTriggerTool
+
+非并发工具(默认):
+  BashTool, FileEditTool, FileWriteTool,
+  NotebookEditTool, TaskUpdateTool, AgentTool
+```
+
+#### 结果大小控制
+
+```typescript
+// 每工具上限
+tool.maxResultSizeChars: number
+// 例: BashTool=30000, GrepTool=20000, 大部分=100000
+
+// 全局常量
+DEFAULT_MAX_RESULT_SIZE_CHARS = 50_000
+MAX_TOOL_RESULT_BYTES = 400_000          // ~100K tokens
+MAX_TOOL_RESULTS_PER_MESSAGE_CHARS = 200_000  // 单消息所有工具总和
+
+// 超限处理:
+// 1. 持久化到磁盘: ~/.claude/sessions/{sessionId}/tool-results/{toolUseId}.txt
+// 2. 返回前2000字节摘要 + 文件路径
+// 3. 包裹在 <persisted-output> XML 标签中
+
+// 单消息预算强制:
+// 如果同一轮所有工具结果 > 200K:
+//   → 持久化最大的新结果直到总量低于预算
+//   → 旧轮次的持久化决定保持不变(缓存友好)
+```
+
+#### MCP 工具集成
+
+```typescript
+// MCP 工具命名: mcp__{serverName}__{toolName}
+// 例: mcp__github__list_issues
+
+// 克隆 MCPTool 模板 → 覆盖 name/call/description/prompt
+// 设置 isMcp=true, mcpInfo={serverName, toolName}
+// 默认 shouldDefer=true (除非 alwaysLoad)
+// 按名称排序(保证 prompt cache 稳定)
+```
+
+#### 子智能体工具限制
+
+```typescript
+// 所有子智能体禁用的工具:
+DISALLOWED = [TaskOutput, ExitPlanMode, EnterPlanMode, AskUserQuestion, TaskStop]
+
+// 异步子智能体可用工具 (~15个):
+ASYNC_ALLOWED = [FileRead, WebSearch, TodoWrite, Grep, WebFetch, Glob,
+                 Bash, FileEdit, FileWrite, NotebookEdit, Skill, ...]
+
+// 进程内队友额外可用:
+TEAMMATE_ALLOWED = [TaskCreate, TaskGet, TaskList, TaskUpdate, SendMessage, Cron*]
+```
+
 ---
 
 ## 4. System Prompt
